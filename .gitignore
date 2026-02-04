@@ -1,9 +1,39 @@
+# Data
+*.txt
+
+*.table2
+*.xlsx
+*.xlsx#
+*.csv
+*.tif
+*.tfw
+*.tree
+*.dbf
+*.xml
+*.ovr
+*.zip
+*.shp
+*.shx
+*.prj
+*.pdf
+*.qix
+*.cpg
+*.doc
+*.docx
+*.gpkg
+*.sqlite
+*.html
+*.grib
+*.svg
+*.odt
+*.table
+
 # History files
 .Rhistory
 .Rapp.history
 
 # Session Data files
-.RData
+*.RData
 .RDataTmp
 
 # User-specific files
