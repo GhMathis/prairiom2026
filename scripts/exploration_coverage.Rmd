@@ -1,0 +1,254 @@
+---
+title: "exploration coverage"
+output: html_document
+date: "2026-02-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# Load pacakges
+
+```{r}
+library(tidyverse)
+library(viridis)
+```
+
+
+# Functions
+
+## Relative abudance and each OTU
+
+Sum prob density of all species give the percentage of AVS we can detect (use zymo to setup the correct level of detection of the less represented ASV)
+```{r}
+
+create.a.composition <- function(S, abund_rel_dominante_sp = 0.05){
+  dnbinom(x = seq(0, S-1, by=1), size = 1, prob = abund_rel_dominante_sp)
+}
+
+create.a.composition(S = 100) %>%
+  sum
+
+```
+
+## Sampling process of the community
+
+```{r}
+simulate.sampling <- function(AVS_density, n_samples = 10, samples_sizes = 1000) {
+  
+  # Number of ASV
+  S <- length(AVS_density)
+  
+  # Normalize (in case not already done)
+  prob_vector <- AVS_density / sum(AVS_density)
+  
+  # Sample n_samples times from the multinomial distribution
+  sample_matrix <- rmultinom(n = n_samples, 
+                             size = samples_sizes, 
+                             prob = prob_vector)
+  
+  # Add names
+  rownames(sample_matrix) <- paste0("ASV_", 1:S)
+  colnames(sample_matrix) <- paste0("sample_", 1:n_samples)
+  
+  simulation_object = list(AVS_density = AVS_density, sample_matrix = sample_matrix)
+  return(simulation_object)
+}
+
+```
+
+## Amplification
+
+```{r}
+amplify.samples <- function(simulation_object, n_cycles = 20){
+  S <- length(simulation_object[["AVS_density"]])
+  sample_matrix <- simulation_object[["sample_matrix"]]
+  
+  # ASV specific amplification factor
+  amplification_df <- data.frame(amplification_factors = runif(n = S, min=1.9, max= 2),
+                                AVS_density = simulation_object[["AVS_density"]],
+                                ASV = paste0("ASV_", 1:S))
+  
+  sample_matrix %>%
+    as.data.frame %>%
+    rownames_to_column("ASV") %>%
+    pivot_longer(-ASV, names_to = "samples", values_to = "reads") %>%
+    left_join(amplification_df, by ="ASV") %>%
+    mutate(reads = reads*(amplification_factors^n_cycles)) %>%
+    dplyr::select(-c(amplification_factors, AVS_density)) %>%
+    pivot_wider(names_from = "samples", values_from = "reads") %>%
+    column_to_rownames("ASV") -> amplified_matrix
+  
+   simulation_object <- list(sample_matrix = sample_matrix,
+                            amplification_df = amplification_df,
+                            amplified_matrix = amplified_matrix)
+   
+   return(simulation_object)
+}
+
+```
+
+## Sequencing
+
+```{r}
+simulate.sequencing <- function(simulation_object,
+                                target_depth = 5000,
+                                depth_variation = 0.1,
+                                dropout_threshold = 5) {
+  
+  amplified_matrix <- simulation_object[["amplified_matrix"]]
+  n_samples <- ncol(amplified_matrix)
+  S <- nrow(simulation_object[["amplification_df"]])
+ 
+  
+  sequenced_matrix <- matrix(0, nrow = S, ncol = n_samples)
+  rownames(sequenced_matrix) <- rownames(amplified_matrix)
+  colnames(sequenced_matrix) <- colnames(amplified_matrix)
+  for(sample_idx in 1:n_samples) {
+    
+    # Variable sequencing depth per sample
+    actual_depth <- round(rnorm(1, mean = target_depth, sd = target_depth * depth_variation))
+    actual_depth <- max(500, actual_depth)  # minimum depth
+    actual_depth
+    
+    # Get relative abundances from amplified pool
+    total_molecules <- sum(amplified_matrix[, sample_idx])
+    prob_vector <- amplified_matrix[, sample_idx] / total_molecules
+    
+    # Multinomial sampling (sequencing is random sampling from the pool)
+    sequenced_counts <- rmultinom(1, size = actual_depth, prob = prob_vector)
+    
+    # Apply dropout: species below threshold are randomly lost
+    # low_abundance <- sequenced_counts < dropout_threshold
+    # dropout_mask <- low_abundance & (runif(S) < 0.3)  # 30% chance of dropout
+    # sequenced_counts[dropout_mask] <- 0
+    
+    sequenced_matrix[, sample_idx] <- sequenced_counts
+  }
+  
+  simulation_object[["sequenced_matrix"]] <- sequenced_matrix
+  
+  return(simulation_object)
+}
+```
+
+
+
+```{r}
+create.a.composition(S = 200) %>%
+  simulate.sampling(AVS_density = ., n_samples = 10, samples_sizes = 1000) %>%
+  amplify.samples(simulation_object = ., n_cycles = 20) %>%
+  simulate.sequencing(simulation_object = ., target_depth = 5000, depth_variation = 0.1) -> simulation1
+simulation1$sequenced_matrix[,3] %>% table
+  
+```
+
+```{r}
+simulation1$sequenced_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column("ASV") %>%
+  left_join(simulation1$amplification_df, by ="ASV") %>%
+  pivot_longer(-c(ASV,amplification_factors, AVS_density), names_to = "samples", values_to = "reads") %>%
+  group_by(samples) %>%
+  mutate(relative_abund = reads/sum(reads)) -> relative_abund_df
+  
+```
+
+```{r}
+relative_abund_df %>%
+  ggplot() +
+  geom_point(aes(AVS_density,relative_abund , col = log1p(AVS_density))) +
+  facet_wrap(~samples)+
+  theme(legend.position = "none")+ 
+  scale_color_viridis(discrete = F)
+```
+
+
+
+```{r}
+duplicate_sample <- function(abundance_values) {
+  abundance_values %>%
+    rep(x = ., n_samples)
+}
+
+amplify_sample <- function(a_sample, n_cycles) {
+  if (n_cycles < 0) { stop("'n_cycles' must be >= 0") }
+  if (n_cycles > 50) { stop("'n_cycles' is too large") }
+  tibble(reads = a_sample) %>%
+    mutate(scalling_factor = runif(n = length(abundances), min = 1, max = 2),
+           reads = round(reads * (scalling_factor ** n_cycles))) %>%
+    select(reads) %>%
+    as.data.frame()
+}
+
+sequence_sample <- function(a_sample, n_reads) {
+  a_sample %>%
+    as.data.frame() %>%
+    vegan::rrarefy(sample = n_reads) %>%
+    t() %>%
+    as_tibble() %>%
+    rownames_to_column(var = "species")
+}
+
+compute_stats <- function(many_samples, n_cycles) {
+  many_samples %>%
+    mutate(n_cycles = n_cycles) %>%
+    group_by(n_cycles, species) %>%
+    summarise(mean = mean(reads),
+              variance = var(reads),
+              .groups = "drop")
+}
+str(temp)
+process_sample <- function(n_cycles) {
+  a_sample %>%
+    duplicate_sample %>%
+    purrr::modify(amplify_sample, n_cycles = n_cycles) %>%
+    purrr::map_dfr(sequence_sample, n_reads = n_reads) %>%
+    compute_stats(n_cycles = n_cycles)
+}
+
+replicate_study <- function(n_cycles, n_replicates) {
+  n_replicates %>%
+    seq(from = 1, to = .) %>%
+    purrr::imap_dfr(~ process_sample(n_cycles = n_cycles),
+                    .id = "replicate")
+}
+```
+
+# Parameter
+
+```{r}
+S =4
+scalling_factor <- runif(n = S, min = 1, max = 2)
+abundances <- rlnorm(n = S)
+hist(abundances, breaks = 20)
+a_sample <- list(reads = abundances)
+n_samples <- 79
+n_reads <- 200
+n_replicates <- 10
+
+abundances %>%
+  rep(x = ., n_samples)
+```
+
+# Simulation
+
+```{r}
+replicate_study(n_cycles = 0, n_replicates = n_replicates) -> metagenomics
+replicate_study(n_cycles = 10, n_replicates = n_replicates) -> metabarcoding
+
+
+bind_rows(metagenomics, metabarcoding) %>%
+  ggplot(aes(x = log(mean), y = log(variance))) +
+  geom_abline(aes(intercept = 0, slope = 1))+
+  geom_abline(aes(intercept = 0, slope = 2))+
+  geom_point() +
+  geom_point(size = 2) +
+  theme_bw(base_size = 16) +
+  expand_limits(x = 0, y = 0)
+
+```
+

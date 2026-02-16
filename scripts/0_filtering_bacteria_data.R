@@ -160,7 +160,7 @@ filtered %>%
 # It ultimately converts the data from a long format into a structured wide 
 # table for downstream analysis.
 
-filtered %>% view
+filtered %>% 
   select(OTU,taxonomy) %>% 
   filter(OTU %in% rownames(my_otu)) %>% # Remove absent OTU (useless here)
   separate_longer_delim(col = taxonomy, delim = "|") %>% 
@@ -249,9 +249,10 @@ my_ordered_samples %>%
   str_sub(., end = -12) -> my_labels
 
 mock_expected %>%
-  mutate(sample_ID = "Mock") %>%
-  group_by(sample_ID, genus, frq) %>% 
-  summarise(frq = sum(frq)) -> mock_exp
+  select( genus, frq, frq_log) %>%
+  pivot_longer(cols = c(frq,frq_log), names_to = "sample_ID") %>%
+  mutate(sample_ID = str_c("Expected_",sample_ID)) %>%
+  dplyr::rename(frq = "value") -> mock_exp
 
 my_otu %>% 
   select(all_of(zymo_samples)) %>% 
@@ -266,6 +267,7 @@ my_tax %>%
 
 my_df_ZYMO %>% 
   left_join(., my_tax_ZYMO, by = "OTU") -> my_df_ZYMO 
+my_df_ZYMO$sample_ID %>% unique
 
 my_df_ZYMO %>% 
   group_by(sample_ID, genus) %>% 
@@ -273,7 +275,7 @@ my_df_ZYMO %>%
   group_by(sample_ID) %>% 
   mutate(frq = read_count/sum(read_count)) %>%
   ungroup() %>%
-  mutate(genus = ifelse(frq < 0.0001, "Others", genus)) %>% 
+ # mutate(genus = ifelse(frq < 0.0001, "Others", genus)) %>% 
   bind_rows(., mock_exp) %>% 
   ggplot(., aes(x = sample_ID, y = frq, fill = genus)) +
   geom_bar(stat = "identity") +
@@ -287,9 +289,58 @@ my_df_ZYMO %>%
         legend.text = element_text(size = 11)) +
   guides(fill = guide_legend(ncol = 1))+
   labs(x="Runs", y = "Relative abundances", fill="Genera") +  
-  scale_x_discrete(limits = c(my_ordered_samples, "Mock"), labels = c(my_labels, "Expected"))+
+  #scale_x_discrete(limits = c(my_ordered_samples, "Mock"), labels = c(my_labels, "Expected"))+
   scale_fill_paletteer_d("ggsci::default_igv")
 
+my_df_ZYMO %>% 
+  group_by(sample_ID, genus) %>% 
+  summarise(read_count = sum(reads)) %>%
+  group_by(sample_ID) %>% 
+  mutate(frq = read_count/sum(read_count)) %>%
+  ungroup() %>%
+  # mutate(genus = ifelse(frq < 0.0001, "Others", genus)) %>% 
+  bind_rows(., mock_exp) %>%
+  filter(str_detect(sample_ID, "log")) %>% 
+  ggplot(., aes(x = sample_ID, y = frq, fill = genus)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        legend.direction = "vertical",
+        legend.justification = "top",
+        legend.box = "vertical",
+        legend.key.size = unit(0.5, "cm"),
+        axis.text.x = element_text(angle=90, vjust=0.4, hjust=1.2),
+        legend.text = element_text(size = 11)) +
+  guides(fill = guide_legend(ncol = 1))+
+  labs(x="Runs", y = "Relative abundances", fill="Genera") +  
+  #scale_x_discrete(limits = c(my_ordered_samples, "Mock"), labels = c(my_labels, "Expected"))+
+  scale_fill_paletteer_d("ggsci::default_igv") +
+  scale_y_log10()
+
+my_df_ZYMO %>% 
+  group_by(sample_ID, genus) %>% 
+  summarise(read_count = sum(reads)) %>%
+  group_by(sample_ID) %>% 
+  mutate(frq = read_count/sum(read_count)) %>%
+  ungroup() %>%
+  # mutate(genus = ifelse(frq < 0.0001, "Others", genus)) %>% 
+  bind_rows(., mock_exp) %>%
+  filter(str_detect(sample_ID, "log")) %>% 
+  ggplot(., aes(x = sample_ID, y = frq, fill = genus)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(legend.position = "right",
+        legend.direction = "vertical",
+        legend.justification = "top",
+        legend.box = "vertical",
+        legend.key.size = unit(0.5, "cm"),
+        axis.text.x = element_text(angle=90, vjust=0.4, hjust=1.2),
+        legend.text = element_text(size = 11)) +
+  guides(fill = guide_legend(ncol = 1))+
+  labs(x="Runs", y = "Relative abundances", fill="Genera") +  
+  #scale_x_discrete(limits = c(my_ordered_samples, "Mock"), labels = c(my_labels, "Expected"))+
+  scale_fill_paletteer_d("ggsci::default_igv") +
+  scale_y_log10()
 #Sans les unidentified
 my_df_ZYMO %>%
   filter(!str_detect(genus, "Unk")) %>% 
