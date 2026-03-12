@@ -1,0 +1,77 @@
+---
+title: "Prairiom2026"
+output: 
+  html_document :
+    keep_md : true
+date: "2026-03-12"
+---
+
+```{r include=FALSE}
+library(tidyverse)
+library(leaflet)
+library(sf)
+library(RColorBrewer)
+st_read("data/Shapefile/crop_shapefile.shp") -> soil_occup_crop
+read.table("outputs/clean_data_to_analise/Metadata_grid_CAM.txt", header  = T)-> metadata_grid
+
+# 1. Préparation des données (Conversion Lambert 93 -> WGS84)
+# On s'assure que le fond de carte est au bon format pour Leaflet
+soil_wgs84 <- st_transform(soil_occup_crop, crs = 4326)
+
+# 2. Création de la palette de couleurs basée sur le type de sol (lib)
+pal_soil <- colorFactor(
+  palette = "Set3", # Palette de couleurs harmonieuse
+  domain = soil_wgs84$lib
+)
+
+```
+
+
+```{r echo=FALSE}
+
+# 3. Construction de la carte
+leaflet() %>%
+  addTiles(group = "Plan (OSM)") %>%
+  addProviderTiles(providers$Esri.WorldImagery, group = "Satellite") %>%
+  
+  #--- COUCHE 1 : Polygones d'occupation du sol ---
+  addPolygons(
+    data = soil_wgs84,
+    fillColor = ~pal_soil(lib), # Couleur basée sur le type
+    stroke = F,           # Bordure des polygones
+    fillOpacity = 0.9,
+    popup = ~paste("Type :", lib),
+    group = "Occupation du sol"
+  ) %>%
+  
+  #--- COUCHE 2 : Points d'échantillonnage (AU-DESSUS) ---
+  addCircleMarkers(
+    data = metadata_grid,
+    lng = ~X, lat = ~Y,
+    radius = 7,
+    color = "black",          # Contour noir pour faire ressortir le point
+    fillColor = "white",        # Couleur contrastée
+    stroke = TRUE, 
+    weight = 2,
+    fillOpacity = 0.8,
+    label = ~Grid_code,
+    popup = ~paste0("<strong>Site: </strong>", Grid_code, "<br>",
+                    "<strong>Ecosystème: </strong>", Ecosystem),
+    group = "Points"
+  ) %>%
+  
+  # Légende pour l'occupation du sol
+  addLegend(
+    pal = pal_soil, 
+    values = soil_wgs84$lib, 
+    title = "Occupation du sol",
+    position = "bottomright"
+  ) %>%
+  
+  # Contrôle des couches
+  addLayersControl(
+    baseGroups = c("Plan (OSM)", "Satellite"),
+    overlayGroups = c("Occupation du sol", "Points"),
+    options = layersControlOptions(collapsed = FALSE)
+  )
+```
