@@ -2,12 +2,12 @@
 #### CAMARGUE - BACTERIES ####
 #****************************#
 
-#Packages----
-if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
-BiocManager::install(c("phyloseq", "microbiome", "ComplexHeatmap"), update = FALSE)
-install.packages("microViz",
- repos = c(davidbarnett = "https://david-barnett.r-universe.dev", getOption("repos")))
-install.packages("paletteer")
+# Packages----
+# if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+# BiocManager::install(c("phyloseq", "microbiome", "ComplexHeatmap"), update = FALSE)
+# install.packages("microViz",
+#  repos = c(davidbarnett = "https://david-barnett.r-universe.dev", getOption("repos")))
+# install.packages("paletteer")
 
 
 library(tidyverse)
@@ -16,13 +16,12 @@ library(phyloseq)
 library(microViz)
 library(paletteer)
 # library(ggrepel)
-
 # library(vegan)
 
 #Silva digest----
 #source("scripts/silva_work.R") 
 
-silva_levels <- "data_ref/taxa2ranks_ssu_138.1.table"
+silva_levels <- "data/bacteria/data_ref/taxa2ranks_ssu_138.1.table"
 
 silva_levels %>%
   read_tsv(show_col_types = FALSE) -> taxa2ranks
@@ -30,18 +29,13 @@ silva_levels %>%
 good_taxonomic_levels <- c("domain", "phylum", "class",
                            "order", "family", "genus")
 #*******************----
-#Prepare data for analyses----
+# Prepare data for analyses----
 #**Load data----
-illumina_data = "data/Camargue_diversity_MiSeq_16S_341F_785R_20240417_405_samples.OTU.filtered.cleaved.nosubstringOTUs.mumu.table2"
+illumina_data = "data/bacteria/Camargue_diversity_MiSeq_16S_341F_785R_20240417_405_samples.OTU.filtered.cleaved.nosubstringOTUs.mumu.table2"
 
 illumina_data %>%
   read_tsv(show_col_types = FALSE, progress = FALSE) %>%
   colnames()
-
-illumina_data %>%
-  read_tsv(show_col_types = FALSE, progress = FALSE) %>%
-  filter(str_detect(taxonomy, "yanobacter")) %>% 
-  view()
 
 #**Count organelles----
 illumina_data %>%
@@ -50,13 +44,14 @@ illumina_data %>%
   group_by(organelle) %>% 
   summarise(OTU_number = length(total), read_count = sum(total))
 
-#read count
+# read count
 4822435/(4412547+4822435) #52% des séquences proviennent d'organelles
-#OTU count
+# OTU count
 1341/(1341+29074) #4.4% des OTU sont organelles
 
 #**Filter out organelles and stuff----
-#voir la distribution des No_hit
+# voir la distribution des No_hit
+
 illumina_data %>%
   read_tsv(na = c("", "NA", "*"), 
            show_col_types = FALSE, 
@@ -64,7 +59,7 @@ illumina_data %>%
   select(OTU, taxonomy, identity, length) %>% 
   filter(!str_detect(taxonomy, "Bacteria"))   #1,034 OTUS non assignées aux bactéries
 
-#Filtrer les données
+# Filtrer les données
 illumina_data %>%
   read_tsv(na = c("", "NA", "*"), 
            show_col_types = FALSE, 
@@ -75,9 +70,10 @@ illumina_data %>%
   filter(!str_detect(taxonomy, "endosymbionts")) %>%
   filter(length > 300) %>% 
   filter(identity > 80) %>% 
-  select(-total, -amplicon, -cloud, -chimera, -spread, -length, -quality, -identity, -abundance, -sequence, -references) -> filtered
+  select(-total, -amplicon, -cloud, -chimera, -spread, -length, -quality,
+         -identity, -abundance, -sequence, -references) -> filtered
 
-##**Prepare metadata----
+##*Prepare metadata----
 filtered %>%
   select(-OTU, -taxonomy) %>% 
   colnames() -> all_samples
@@ -115,8 +111,6 @@ data.frame(
 ) %>% 
   column_to_rownames("sample_ID") %>% 
   mutate(sample_ID = rownames(.)) -> my_mtd
-
-read_delim("data/Metadata_grid_CAM.csv")
 
 #**Stats descriptives----
 columns_to_keep <- c("OTU","taxonomy",only_environmental_samples)
@@ -237,7 +231,7 @@ prune_samples(sample_data(ps)$type == "ZYMO", ps) %>%
         legend.text = element_text(size = 11))
 
 #**Theoretical mock----
-read_delim("data_ref/mock_zymo_expected.csv") %>% 
+read_delim("data/bacteria/data_ref/mock_zymo_expected.csv") %>% 
   rename_with(., tolower) %>% 
   rename(frq = rel_ab) %>% 
   mutate(species = str_replace(species, pattern = " ", replacement = "_")) -> mock_expected
@@ -249,7 +243,7 @@ my_ordered_samples %>%
   str_sub(., end = -12) -> my_labels
 
 mock_expected %>%
-  select( genus, frq, frq_log) %>%
+  select( genus, frq, frq_log = "rel_ab_log") %>%
   pivot_longer(cols = c(frq,frq_log), names_to = "sample_ID") %>%
   mutate(sample_ID = str_c("Expected_",sample_ID)) %>%
   dplyr::rename(frq = "value") -> mock_exp
@@ -341,6 +335,7 @@ my_df_ZYMO %>%
   #scale_x_discrete(limits = c(my_ordered_samples, "Mock"), labels = c(my_labels, "Expected"))+
   scale_fill_paletteer_d("ggsci::default_igv") +
   scale_y_log10()
+
 #Sans les unidentified
 my_df_ZYMO %>%
   filter(!str_detect(genus, "Unk")) %>% 
@@ -372,8 +367,6 @@ my_df_ZYMO %>%
   filter(!is.na(genus)) %>% 
   filter(!str_detect(genus, "Unk")) -> false_positives
 
-false_positives %>% 
-  view()
 
 #The false positive most frequent in a mock is below 0.0005 in its sample and below 0.00006 in total ab.
 my_df_ZYMO$genus %>% unique
@@ -383,14 +376,12 @@ my_df_ZYMO %>%
   group_by(sample_ID, genus) %>% 
   summarise(reads = sum(reads)) -> true_positives
 
-true_positives %>% 
-  view() 
+true_positives 
 
 true_positives %>% 
   group_by(sample_ID) %>% 
   mutate(local_rel_ab = reads/sum(reads)) %>% 
-  arrange(local_rel_ab) %>% 
-  view()
+  arrange(local_rel_ab) 
 
 #**Family barplot----
 zymo_samples -> my_ordered_samples
@@ -471,8 +462,7 @@ my_df_ZYMO %>%
   filter(!is.na(family)) %>% 
   filter(!str_detect(family, "Unk")) -> false_positives
 
-false_positives %>% 
-  view()
+false_positives 
 
 #The false positive most frequent in a mock is below 0.0005 in its sample and below 0.00006 in total ab.
 
@@ -481,15 +471,6 @@ my_df_ZYMO %>%
   filter(!str_detect(family, "Unk")) %>%
   group_by(sample_ID, family) %>% 
   summarise(reads = sum(reads)) -> true_positives
-
-true_positives %>% 
-  view() 
-
-true_positives %>% 
-  group_by(sample_ID) %>% 
-  mutate(local_rel_ab = reads/sum(reads)) %>% 
-  arrange(local_rel_ab) %>% 
-  view()
 
 #*******************----
 #MICRODECON----
@@ -505,13 +486,13 @@ data.frame(OTU = rownames(my_otu)) %>%
   cbind.data.frame(., env) -> df_decon
 
 decontaminated <- decon(data = df_decon,numb.blanks=length(colnames(neg)),numb.ind=length(colnames(env)), taxa=F)
-save(decontaminated, file = "outputs/decontaminated.Rdata")
+save(decontaminated, file = "outputs/heavy_computation_save/decontaminated.Rdata")
 
-load("outputs/decontaminated.Rdata")
+load("outputs/heavy_computation_save/decontaminated.Rdata")
 
 #**OTUs à retirer----
 decontaminated$OTUs.removed %>% 
-  pull(OTU)-> otus_to_remove
+  pull(OTU) -> otus_to_remove
 length(otus_to_remove) #il y en a 213
 
 # my_tax %>% 
@@ -521,7 +502,7 @@ length(otus_to_remove) #il y en a 213
 my_otu %>% 
   mutate(.before = 1, total_env = rowSums(.[,only_environmental_samples])) %>%
   filter(total_env==0) %>% 
-  rownames(.)-> OTU_absent_from_env_samples
+  rownames(.) -> OTU_absent_from_env_samples
 
 length(OTU_absent_from_env_samples) #Il y en a 51
 
@@ -583,9 +564,6 @@ ggplot(data=df.pa1, aes(x=pa.neg1, y=pa.pos1, color=contaminant)) +
   xlab("Number of reads in negative Controls (Log scale))") + 
   ylab("Number of reads in true Samples (Log-scale)")  + 
   ggtitle("Decontamination following microDecon")
-
-my_tax %>% 
-  filter(OTU == "5")
 
 #*******************----
 #Objets finaux----
@@ -696,4 +674,4 @@ ps_bacteria %>%
         axis.text.x = element_text(size = 8, angle=90, vjust=0.4, hjust=1.2),
         legend.text = element_text(size = 11))
 
-save(ps_bacteria, file = "outputs/ps_bacteria.Rdata")
+save(ps_bacteria, file = "outputs/clean_data_to_analise/ps_bacteria.Rdata")

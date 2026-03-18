@@ -1,0 +1,103 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-03-18"
+editor_options: 
+  chunk_output_type: console
+---
+```{r}
+library(tidyverse)
+library(sbm)
+```
+
+# Load and arrange data
+
+```{r}
+ps_bacteria %>%
+  otu_table() %>%
+  as.data.frame() %>%
+  rownames_to_column("OTU") %>%
+  pivot_longer(-OTU, names_to = "quadrat_code") %>%
+  mutate(grid_code = str_sub(quadrat_code,1,9),
+         value = floor(value/10)) %>%
+  filter(value > 0) -> trucated_bacteria_quadat
+
+trucated_bacteria_quadat %>%
+  select(-grid_code) %>%
+  pivot_wider(names_from = "quadrat_code", values_from = "value", values_fill = 0) %>%
+  column_to_rownames("OTU") %>%
+  rowSums() %>% 
+  table
+```
+
+
+
+```{r}
+trucated_bacteria_quadat %>%
+  select(-quadrat_code) %>%
+  group_by(grid_code,OTU) %>%
+  summarise(value = sum(value)) %>%
+  ungroup() %>%
+  group_by(OTU) %>%
+  ungroup()  %>% 
+  pivot_wider(names_from = "grid_code", values_from = "value", values_fill = 0) %>%
+  column_to_rownames("OTU") -> trucated_bacteria_grid
+```
+
+for Matthieu
+```{r}
+trucated_bacteria_quadat %>%
+  select(-quadrat_code) %>%
+  group_by(grid_code,OTU) %>%
+  summarise(value = sum(value)) %>%
+  ungroup() %>%
+  group_by(OTU) %>%
+  filter(n() == 1) 
+```
+
+
+# SBM on full matrix
+```{r}
+trucated_bacteria_grid %>% 
+  rownames_to_column("OTU") %>%
+  pivot_longer(-OTU, names_to = "grid_code") %>%
+  mutate(occurence = +(value == 0)) %>%
+  select(-value) %>%
+  pivot_wider(names_from = "grid_code", values_from = "occurence", values_fill = 0) %>%
+  column_to_rownames("OTU")-> occurence_bacteria_grid 
+
+if(file.exists("outputs/heavy_computation_save/SBM_occurence_trunc.Rdata")){
+  load("outputs/heavy_computation_save/SBM_occurence_trunc.Rdata")
+}else{
+  occurence_bacteria_grid %>%
+    as.matrix() %>%
+    estimateBipartiteSBM(netMat= ., model = "bernoulli", 
+                         dimLabels = c(row = "ASV", col = "grid_code"),
+                         estimOptions = list(nbCores = 4)) -> SBM_occurence_trunc
+  save(SBM_occurence_trunc, file ="outputs/heavy_computation_save/SBM_occurence_trunc.Rdata")
+  }
+
+plot(SBM_occurence_trunc,type  = 'meso', 
+     dimLabels = list(row = 'ASV', col= 'grid_code'),
+     plotOptions = list(edge.width = 1,vertex.size =0.1))
+SBM_occurence_trunc$memberships
+SBM_occurence_trunc$connectParam$mean 
+SBM_occurence_trunc$connectParam$mean %>%plotMyMatrix()
+```
+
+```{r}
+trucated_bacteria_grid %>% 
+  as.matrix() %>% 
+  log1p %>% hist
+  estimateBipartiteSBM(netMat= ., model = "poisson", dimLabels = c(row = "ASV", col = "grid_code"),
+                                                                                         estimOptions = list(plot = FALSE,
+                                                                                                             verbosity = 0))
+
+group_split() %>%
+  map(\(x) x %>%
+        select(-grid_code) %>%
+        pivot_wider(names_from = "quadrat_code", values_from = "value", values_fill = 0))
+  
+
+```
+

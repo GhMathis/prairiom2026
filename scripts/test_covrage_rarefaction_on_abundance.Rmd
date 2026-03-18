@@ -1,0 +1,236 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-03-18"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(tidyverse)
+library(phyloseq)
+library(iNEXT.3D)
+library(vegan)
+```
+
+```{r}
+coverage_rarefy_matrix <- function(otu_matrix, 
+                                   required_sizes,
+                                   drop_lowcoverage = FALSE){
+  
+  # Calculer le coverage de chaque échantillon
+  sample_coverages <- apply(otu_matrix, 2, function(sample_vector) {
+    sample_vector <- sample_vector[sample_vector > 0]
+    n <- sum(sample_vector)
+    f1 <- sum(sample_vector == 1)
+    f2 <- sum(sample_vector == 2)
+    
+    if (f1 > 0 && f2 > 0) {
+      1 - (f1 / n) * (((n - 1) * f1) / ((n - 1) * f1 + 2 * f2))
+    } else if (f1 > 0 && f2 == 0) {
+      1 - (f1 / n) * (((n - 1) * f1) / ((n - 1) * f1 + 2))
+    } else {
+      1
+    }
+  })
+  
+  # Coverage cible
+  if (is.null(coverage)) {
+    coverage <- min(sample_coverages)
+  }
+  
+  # Vérifier les échantillons
+  low_coverage <- sample_coverages < coverage
+  if (any(low_coverage)) {
+    if (drop_lowcoverage) {
+      otu_matrix <- otu_matrix[, !low_coverage, drop = FALSE]
+      sample_coverages <- sample_coverages[!low_coverage]
+    } else {
+      stop("Certains échantillons ont un coverage insuffisant")
+    }
+  }
+  
+  
+  # Raréfier chaque échantillon
+  rarefied_matrix <- sapply(colnames(otu_matrix), function(sample_name) {
+    sample_vector <- otu_matrix[, sample_name]
+    target_size <- required_sizes %>%
+      filter(Assemblage == sample_name) %>%
+      pull(m)
+    
+    # Créer un vecteur répété de chaque OTU selon son abondance
+    otu_pool <- rep(rownames(otu_matrix), times = sample_vector)
+    
+    # Échantillonner sans remise
+    sampled_otus <- sample(otu_pool, size = target_size, replace = FALSE)
+    
+    # Compter les abondances
+    rarefied <- table(factor(sampled_otus, levels = rownames(otu_matrix)))
+    
+    return(as.numeric(rarefied))
+  })
+  
+  rownames(rarefied_matrix) <- rownames(otu_matrix)
+  
+  return(rarefied_matrix)
+}
+   
+```
+
+
+```{r}
+load(file = "outputs/clean_data_to_analise/ps_bacteria.Rdata")
+
+calculate.coverage.f1<- function(f1,f2, sample_size){1-(f1/sample_size) * ((sample_size-1)*f1)/((sample_size-1)*f1 + 2*f2)}
+
+ps_bacteria %>%
+  otu_table() %>%
+  as.data.frame() %>%
+  rownames_to_column("OTU") %>%
+  pivot_longer(-OTU, names_to = "quadrat_code", values_to = "reads") %>%
+  mutate(grid_code = str_sub(quadrat_code,1,9),
+         reads = floor(reads/10)) %>%
+  filter(reads > 0) -> trucated_bacteria_quadat
+
+trucated_bacteria_quadat %>%
+  select(-quadrat_code) %>%
+  group_by(grid_code,OTU) %>%
+  summarise(reads = sum(reads))  -> trucated_bacteria_grid
+```
+
+```{r}
+trucated_bacteria_quadat %>%
+  group_by(quadrat_code) %>%
+  mutate(sample_size =sum(reads)) %>%
+  filter(reads <= 4, reads!=0) %>% 
+  group_by(quadrat_code, reads, sample_size) %>% 
+  summarize(count = n(), .groups = "drop") %>% 
+  pivot_wider(names_from =reads , values_from = count, values_fill = 0) %>%
+  rename(f1 ="1", f2 ="2", f3 ="3", f4 ="4") %>%
+  mutate(f1_hat = ifelse(f3*f4>0, 4*f2^2/(3*f3)-f2*f3/(2*f4), 4*f2^2/(3*(f3+1))-f2*f3/(2*(f4+1))),
+         coverage = calculate.coverage.f1(f1 ,f2 , sample_size),
+         coverage_hat = calculate.coverage.f1(f1_hat, f2, sample_size)) -> quadrat_coverage_df
+
+trucated_bacteria_grid %>%
+  group_by(grid_code) %>%
+  mutate(sample_size =sum(reads)) %>%
+  filter(reads <= 4, reads!=0) %>% 
+  group_by(grid_code, reads, sample_size) %>% 
+  summarize(count = n(), .groups = "drop") %>% 
+  pivot_wider(names_from =reads , values_from = count, values_fill = 0) %>%
+  rename(f1 ="1", f2 ="2", f3 ="3", f4 ="4") %>%
+  mutate(f1_hat = ifelse(f3*f4>0, 4*f2^2/(3*f3)-f2*f3/(2*f4), 4*f2^2/(3*(f3+1))-f2*f3/(2*(f4+1))),
+         coverage = calculate.coverage.f1(f1 ,f2 , sample_size),
+         coverage_hat = calculate.coverage.f1(f1_hat, f2, sample_size)) -> grid_coverage_df
+```
+```{r}
+trucated_bacteria_grid %>%
+  pivot_wider(names_from = "grid_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU") %>%
+  t() %>%
+  vegan::rarecurve(x=., step = 500, sample = min(rowSums(.)))
+
+trucated_bacteria_grid %>%
+  pivot_wider(names_from = "grid_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU") %>%
+  iNEXT.3D::iNEXT3D( q = c(0, 1, 2), datatype = "abundance", nboot = 0) -> inext_rare
+
+inext_rare$TDiNextEst$size_based %>% 
+  filter(Order.q == 0) %>%
+  ggplot() +
+  geom_line(aes(x = m, y = qTD, color = Assemblage, linetype = Method)) +
+  geom_point(data = filter(inext_rare$TDiNextEst$size_based %>%
+                              filter(Order.q == 0), Method == "Observed"), 
+             aes(x = m, y = qTD, color = Assemblage),
+             size = 2) +
+  scale_linetype_manual(
+    values = c("Rarefaction" = "solid", 
+               "Extrapolation" = "dashed",
+               "Observed" = "solid")
+    ) +
+  theme_minimal() +
+  labs(x = "Sample Size", y = "Species Richness")
+
+inext_rare$TDiNextEst$coverage_based %>% 
+  filter(Order.q == 0) %>%
+  ggplot() +
+  geom_line(aes(x = SC, y = qTD, color = Assemblage, linetype = Method)) +
+  geom_point(data = filter(inext_rare$TDiNextEst$coverage_based %>%
+                              filter(Order.q == 0), Method == "Observed"), 
+             aes(x = SC, y = qTD, color = Assemblage),
+             size = 2) +
+  scale_linetype_manual(
+    values = c("Rarefaction" = "solid", 
+               "Extrapolation" = "dashed",
+               "Observed" = "solid")
+    ) +
+  theme_minimal() +
+  labs(x = "Sample Size", y = "Species Richness")
+
+inext_rare$TDiNextEst$coverage_based %>% 
+  filter(Order.q == 0 & Method == "Observed") %>%
+  filter(SC == min(SC, na.rm = TRUE)) %>%
+  pull(SC) -> min_coverage
+
+trucated_bacteria_grid %>%
+  pivot_wider(names_from = "grid_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU") %>%
+  estimate3D( level = NULL,q = 0, nboot = 0) %>%
+  filter(Method == "Observed")
+```
+
+```{r}
+trucated_bacteria_grid %>%
+  pivot_wider(names_from = "grid_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU") %>%
+  coverage_rarefy_matrix() -> test
+
+test %>% colSums
+```
+
+
+```{r}
+trucated_bacteria_grid %>%
+  pivot_wider(names_from = "grid_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU") %>%
+  coverage_rarefy_matrix()
+```
+
+```{r}
+trucated_bacteria_grid %>%
+              pivot_wider(names_from = "grid_code", values_from = "reads", values_fill = 0) %>%
+              column_to_rownames("OTU") -> otu_matrix
+# Calculer les tailles requises
+iNext_object <- otu_matrix %>%
+  iNEXT.3D::iNEXT3D( q = c(0), datatype = "abundance", nboot = 0)
+
+inext_rare$TDiNextEst$coverage_based %>% 
+  filter(Order.q == 0 & Method == "Observed") %>%
+  filter(SC == min(SC, na.rm = TRUE)) %>%
+  pull(SC) -> min_coverage
+
+otu_matrix %>%
+  estimate3D(level = min_coverage, q = 0, nboot = 0) %>%
+  select(Assemblage,m) -> required_sizes
+
+set.seed(2365)
+1:100 %>%
+  map(\(x) otu_matrix %>%
+              coverage_rarefy_matrix(required_sizes = required_sizes)) -> coverage_rarefy_list
+
+coverage_rarefy_list[[1]] %>% str
+coverage_rarefy_list[[2]] %>% str
+
+coverage_rarefy_list[[1]]%>% hist
+```
+
+
+```{r}
+library(sbm)
+coverage_rarefy_list[[1]] %>%
+    as.matrix() %>%
+    estimateBipartiteSBM(netMat= ., model = "poisson", 
+                         dimLabels = c(row = "ASV", col = "grid_code"),
+                         estimOptions = list(nbCores = 4))
+```
+

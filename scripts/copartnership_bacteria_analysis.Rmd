@@ -1,0 +1,214 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-03-16"
+---
+
+# Load package and data  
+
+```{r}
+library(tidyverse)
+library(sbm)
+library(phyloseq)
+library(viridis)
+library(alluvial)
+```
+
+
+```{r}
+load(file = "outputs/heavy_computation_save/subsample_list_bact.Rdata")
+load(file = "outputs/heavy_computation_save/subsample_sbm_bact.Rdata")
+load(file = "outputs/clean_data_to_analise/ps_bacteria.Rdata")
+```
+
+# Arrange some of the main data
+
+```{r}
+ps_bacteria_grid <- merge_samples(ps_bacteria, "grid")
+ps_bacteria_grid %>%
+  otu_table() %>% 
+  t() %>%
+  as.data.frame() -> bacteria_grid_df
+dim(bacteria_grid_df)
+n_sim = length(x = subsample_sbm_list)
+```
+
+```{r}
+for(sim in 1:5){
+  print(plotMyMatrix(log1p(as.matrix(subsample_list[[sim]]))))
+}
+
+```
+
+
+```{r}
+map(1:n_sim, \(x) data.frame(subsample = subsample_sbm_list[[x]]$memberships$grid_code,
+                             grid_code = colnames(subsample_list[[1]]),
+                             sim = x)
+    ) %>%
+  bind_rows() %>%
+  pivot_wider(names_from = sim, names_glue = "simulation{sim}", values_from = "subsample") %>%
+  column_to_rownames("grid_code") -> cluster_df
+```
+
+```{r}
+n_echantillons <- nrow(cluster_df)
+grid_cluster_mat <- matrix(0, nrow = n_echantillons, ncol = n_echantillons)
+
+for (sim in 1:n_sim) {
+  grid_cluster_mat <- grid_cluster_mat + outer(cluster_df[[sim]], cluster_df[[sim]], "==")
+}
+
+rownames(grid_cluster_mat) <- rownames(cluster_df)
+colnames(grid_cluster_mat) <- rownames(cluster_df)
+grid_cluster_mat %>%
+  as.data.frame() %>%
+  rownames_to_column("grid_code") %>%
+  pivot_longer(-grid_code, names_to = "name", values_to = "value") %>%
+  # Create two temporary columns where the names are ALWAYS sorted
+  # pmin/pmax ensures that (Sample_A, Sample_B) and (Sample_B, Sample_A) 
+  # both become (Sample_A, Sample_B)
+  mutate(
+    p1 = pmin(grid_code, name),
+    p2 = pmax(grid_code, name)
+  ) %>%
+  # Distinct now recognizes these rows as identical
+  distinct(p1, p2, .keep_all = TRUE) %>%
+  # Drop temporary columns
+  select(grid_code, name, value) %>%
+  ggplot() +
+    geom_histogram(aes(value)) +
+    theme_minimal() +
+    labs(x = "N time grids are in the same group (after 1000 sbm)")
+
+plotMyMatrix(grid_cluster_mat, c(row = "grids", col = "grids"))
+
+```
+
+There are cleare group of sample that are appearing. 
+It could be interesting to see what are teh clsuter found by an other sbm on this matrix
+
+```{r}
+estimateSimpleSBM(grid_cluster_mat,model = "poisson") -> sbm_copartnership
+```
+
+
+```{r}
+plot(sbm_copartnership)
+```
+
+```{r}
+diff_sequencingdepth <- as.matrix(dist(colSums(bacteria_grid_df)))
+colnames(grid_cluster_mat) == colnames(diff_sequencingdepth)
+rownames(grid_cluster_mat) == rownames(diff_sequencingdepth)
+
+estimateSimpleSBM(grid_cluster_mat,model = "poisson", covariates = list(diff_sequencingdepth)) -> sbm_copartnership_depth_covar
+
+hclust(grid_cluster_mat)
+
+```
+
+
+```{r}
+plot(sbm_copartnership_depth_covar)
+plot(sbm_copartnership)
+```
+
+
+Sequencing depth could biais a lot clustering of subsamples. Thus I will try to put sequecing depth as covariate of the SMB
+
+# Sequencing depth as covariate
+
+First : test with one subsample (number one).
+
+```{r}
+if(file.exists("outputs/heavy_computation_save/smb_offset_test_on_subsample_one.Rdata")){
+  
+  load("outputs/heavy_computation_save/smb_offset_test_on_subsample_one.Rdata")  
+  
+}else{ 
+    
+  subsample_list[[1]] %>% 
+    as.matrix() %>%
+    log1p %>% 
+    estimateBipartiteSBM(
+      netMat       = ., 
+      model        = "poisson", 
+      dimLabels    = c(row = "ASV", col = "grid_code"),
+      covariates   = list(library_size = covar_mat), # Liste nommée de matrices
+      estimOptions = list(plot = FALSE, verbosity = 0)
+    ) -> test
+    save(test, file = "outputs/heavy_computation_save/smb_offset_test_on_subsample_one.Rdata")
+  }
+```
+
+Problem : this is really computationally heave, around 2h for one SBM
+
+```{r}
+plot(test)
+plot(subsample_sbm_list[[1]])
+
+
+subsample_sbm_list[[1]]$memberships$grid_code
+test$memberships$grid_code
+str(test$covarEffect)
+str(test$covarArray)
+
+test$connectParam
+test$
+
+
+B <- as.data.frame(
+    table(
+      
+      colnames(bacteria_grid_df),
+      subsample_sbm_list[[1]]$memberships$grid_code ,
+      test$memberships$grid_code
+      )
+  )
+
+colnames(B) =  c( "grid_code","sbm_bact", "sbm_bact_covariate","Freq")
+
+data.frame(library_size = sort(colSums(bacteria_grid_df), decreasing = TRUE),
+           col_library_size = viridis(43)) %>%
+  rownames_to_column("grid_code")-> col_library_size_df
+
+
+B %>%
+  left_join(col_library_size_df, by = "grid_code") -> B
+
+
+
+
+w   <- which(B$Freq != 0)
+B <- B[w, ]
+
+B$library_size <- factor(B$library_size, 
+                         levels = sort(unique(B$library_size), decreasing = TRUE))
+alluvial(B[,c(5,2,3)],
+         freq = B$Freq,
+         col = B$col_library_size,
+         alpha = 0.7,
+         cex = 1.5,
+         cex.axis = 1.5,
+         xw = 0.2)
+```
+
+
+```{r}
+B %>%
+  group_by(sbm_bact) %>%
+  summarise(mean_library_size = mean(as.numeric(as.character(library_size)))) %>%
+  arrange(mean_library_size)
+
+B %>%
+  group_by(sbm_bact_covariate) %>%
+  summarise(mean_library_size = mean(as.numeric(as.character(library_size)))) %>%
+  arrange(mean_library_size)
+```
+
+Using sequencing depth as covariate of the SBM doesn't correctthe effect of library size. It lead, however, to a some change in the clustering.
+
+
+
+
