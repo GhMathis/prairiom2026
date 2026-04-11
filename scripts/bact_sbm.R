@@ -284,6 +284,8 @@ bacteria_grid_subsample %>% colSums()
 
 library(furrr)
 
+#### Random subsample of abundance matrix and SBM ----
+
 if(file.exists("outputs/heavy_computation_save/subsample_sbm_bact.Rdata")){
   
   load(file = "outputs/heavy_computation_save/subsample_list_bact.Rdata")
@@ -312,4 +314,147 @@ if(file.exists("outputs/heavy_computation_save/subsample_sbm_bact.Rdata")){
 save(subsample_sbm_list, file = "outputs/heavy_computation_save/subsample_sbm_bact.Rdata")
   }
 
+#### Random subsample of occurence matrix and SBM ----
 
+if(file.exists("outputs/heavy_computation_save/subsample_sbm_bact_binar.Rdata")){
+  
+  load(file = "outputs/heavy_computation_save/subsample_sbm_bact.Rdata")
+  
+  }else{
+  
+  plan(multisession, workers = 7)
+  subsample_list %>%
+    furrr::future_map(\(x) x %>% 
+                        mutate(across(where(is.numeric), ~ as.integer(.x > 0))) %>%
+                        as.matrix() %>%
+                        estimateBipartiteSBM(netMat= ., model = "bernoulli", 
+                                             dimLabels = c(row = "ASV", col = "grid_code"),
+                                             estimOptions = list(plot = FALSE,
+                                                                 verbosity = 0)),
+                      .options = furrr_options(scheduling = 2),
+                      .progress = T
+    ) -> subsample_sbm_binar_list
+  
+  save(subsample_sbm_binar_list, file = "outputs/heavy_computation_save/subsample_sbm_bact_binar.Rdata")
+  }
+
+subsample_list[[1]] %>% 
+  mutate(across(where(is.numeric), ~ as.integer(.x > 0))) %>%
+  as.matrix() %>%
+  estimateBipartiteSBM(netMat= ., model = "bernoulli", dimLabels = c(row = "ASV", col = "grid_code")) -> test_sbm_binary
+
+plot(test_sbm_binary)
+test_sbm_binary$connectParam
+
+subsample_sbm_binar_list[[1]] %>% plot
+subsample_sbm_binar_list[[2]] %>% plot
+subsample_sbm_binar_list[[3]] %>% plot
+
+subsample_sbm_binar_list[[1]]$memberships
+subsample_sbm_binar_list[[2]]$memberships
+subsample_sbm_binar_list[[3]]$memberships
+
+subsample_sbm_binar_list[[1]]$connectParam
+subsample_sbm_binar_list[[2]]$connectParam
+subsample_sbm_binar_list[[3]]$connectParam
+
+#### Agglomération at genus level ----
+
+ps_bacteria_genus_grid <- ps_bacteria_grid %>%
+  tax_glom(taxrank = "genus")
+
+ps_bacteria_genus_grid %>%
+  tax_table() %>%
+  head
+
+ps_bacteria_genus_grid %>%
+  otu_table() %>%
+  t() %>%
+  rowSums() %>%
+  sort
+
+ps_bacteria_genus_grid %>%
+  otu_table() %>%
+  t() %>%
+  as.vector() %>%
+  hist
+
+ps_bacteria_genus_grid %>%
+  otu_table() %>%
+  log1p %>% 
+  plotMyMatrix()
+
+ps_bacteria_genus_grid %>% 
+  otu_table() %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(across(where(is.numeric), ~ as.integer(.x > 0))) %>%
+  as.matrix() %>%
+  estimateBipartiteSBM(netMat= ., model = "bernoulli", dimLabels = c(row = "ASV", col = "grid_code")) -> smb_bin_genus
+
+plot(smb_bin_genus)
+smb_bin_genus$memberships$grid_code %>% table
+smb_bin_genus$connectParam
+smb_bin_genus$memberships$ASV %in% c(9,10) -> rare_genus
+
+ps_bacteria_genus_grid %>%
+  tax_table() %>%
+  as.data.frame() %>%
+  rownames_to_column("tax_id") %>%
+  filter(rare_genus)
+ps_bacteria_genus_grid %>%
+  otu_table() %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("tax_id") %>%
+  filter(rare_genus) %>%
+  column_to_rownames("tax_id") %>%
+  rowSums() %>% sort
+ps_bacteria_genus_grid %>%
+  tax_table() %>%
+  as.data.frame() %>%
+  rownames_to_column("tax_id") %>%
+  filter(tax_id == 312)
+ps_bacteria_genus_grid %>%
+  otu_table() %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("tax_id") %>%
+  filter(tax_id == 75)
+
+ps_bacteria_genus_grid %>%
+  otu_table() %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column("tax_id") %>%
+  filter(rare_genus) %>%
+  column_to_rownames("tax_id") %>%
+  as.matrix() %>%
+  log1p %>% plotMyMatrix()
+
+ps_bacteria_genus_grid %>%
+  otu_table() %>%
+  t() %>%
+  colSums()
+#### Multiplex and abundance are way too long to run
+
+# ps_bacteria_genus_grid %>%
+#   otu_table() %>%
+#   t() %>%
+#   estimateBipartiteSBM(netMat= ., model = "poisson", dimLabels = c(row = "ASV", col = "grid_code")) -> smb_poisson_genus
+# 
+# ps_bacteria_genus_grid %>% 
+#   otu_table() %>%
+#   t() %>%
+#   as.data.frame() %>%
+#   mutate(across(where(is.numeric), ~ as.integer(.x > 0))) %>%
+#   as.matrix() %>%
+#   defineSBM(model = "bernoulli", dimLabels = c(row = "ASV", col = "grid_code")) -> net_bin
+# 
+# ps_bacteria_genus_grid %>%
+#   otu_table() %>%
+#   t() %>%
+#   defineSBM(model = "poisson", dimLabels = c(row = "ASV", col = "grid_code")) -> net_pois
+# (net_bin)
+# plotMyMultiplexMatrix(list(net_bin, net_pois))
+# MultiplexFitIndep <- estimateMultiplexSBM(list(net_bin, net_pois), dependent = F)

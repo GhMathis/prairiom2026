@@ -86,7 +86,7 @@ plotMyMatrix(grid_cluster_mat, c(row = "grids", col = "grids"))
 ```
 
 There are cleare group of sample that are appearing. 
-It could be interesting to see what are teh clsuter found by an other sbm on this matrix
+It could be interesting to see what are the cluster found by an other sbm on this matrix
 
 ```{r}
 estimateSimpleSBM(grid_cluster_mat,model = "poisson") -> sbm_copartnership
@@ -103,9 +103,6 @@ colnames(grid_cluster_mat) == colnames(diff_sequencingdepth)
 rownames(grid_cluster_mat) == rownames(diff_sequencingdepth)
 
 estimateSimpleSBM(grid_cluster_mat,model = "poisson", covariates = list(diff_sequencingdepth)) -> sbm_copartnership_depth_covar
-
-hclust(grid_cluster_mat)
-
 ```
 
 
@@ -155,7 +152,6 @@ str(test$covarEffect)
 str(test$covarArray)
 
 test$connectParam
-test$
 
 
 B <- as.data.frame(
@@ -207,7 +203,7 @@ B %>%
   arrange(mean_library_size)
 ```
 
-Using sequencing depth as covariate of the SBM doesn't correctthe effect of library size. It lead, however, to a some change in the clustering.
+Using sequencing depth as covariate of the SBM doesn't correct the effect of library size. It lead, however, to a some change in the clustering.
 
 
 

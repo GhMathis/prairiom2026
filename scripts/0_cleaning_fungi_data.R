@@ -1,9 +1,13 @@
 #Packages----
 library(tidyverse)
 library(phyloseq)
+# BiocManager::install("microbiome")
 library(microbiome)
-library(microViz)
-
+# BiocManager::install("microViz")
+#library(microViz)
+# install.packages("remotes")
+# remotes::install_github("donaldtmcknight/microDecon")
+library("microDecon")
 
 #Load data----
 input_table <- "data/fungi/Camargue_diversity_MiSeq_ITS2_ITS86F_ITS4r_20240220_818_samples.OTU.filtered.cleaved.nosubstringOTUs.mumu.table2"
@@ -163,7 +167,6 @@ as_tibble(colnames(my_otu)) %>%
   column_to_rownames("row_ID")  -> my_mtd
 
 #PHYLOSEQ----
-library(phyloseq)
 
 sample_data(my_mtd) -> MTD
 
@@ -197,9 +200,7 @@ my_otu %>%
 
 #*******************----
 #MicroDecon----
-# install.packages("remotes")
-# remotes::install_github("donaldtmcknight/microDecon")
-library("microDecon")
+
 
 my_mtd %>% 
   filter(type=="NEG") %>% 
@@ -324,7 +325,11 @@ my_tax %>%
 #clearNames(ps.pa, ps.pa.neg, ps.pa.pos, ps.decon, ps.decon.neg, ps.decon.pos)
 
 my_mtd %>% 
-  filter(type=="ENV") -> my_mtd_env 
+  filter(type=="ENV") %>%
+  mutate(quadra_code = str_sub(sample_ID, 1,12),
+         quadra_code = str_replace_all(quadra_code, "-","_"),
+         grid_code = str_sub(quadra_code, 1,9)) -> my_mtd_env
+
 rownames(my_mtd_env) <- my_mtd_env$sample_ID
 sample_data(my_mtd_env) -> MTD
 
@@ -339,17 +344,17 @@ sample_names(MTD)
 ps_fungi = phyloseq(OTU, TAX, MTD)
 
 #TRANFERT pour MATHIS----
-ps_fungi %>% 
-  tax_fix() %>% 
-  comp_barplot(tax_level = "class", n=30)+
-  theme_minimal() +
-  theme(legend.position = "right",
-        legend.direction = "vertical",
-        legend.justification = "top",
-        legend.box = "vertical",
-        legend.key.size = unit(0.5, "cm"),
-        axis.text.x = element_text(size = 8, angle=90, vjust=0.4, hjust=1.2),
-        legend.text = element_text(size = 11))
+# ps_fungi %>% 
+#   tax_fix() %>% 
+#   comp_barplot(tax_level = "class", n=30)+
+#   theme_minimal() +
+#   theme(legend.position = "right",
+#         legend.direction = "vertical",
+#         legend.justification = "top",
+#         legend.box = "vertical",
+#         legend.key.size = unit(0.5, "cm"),
+#         axis.text.x = element_text(size = 8, angle=90, vjust=0.4, hjust=1.2),
+#         legend.text = element_text(size = 11))
 
 
 save(ps_fungi, file = "outputs/clean_data_to_analise/ps_fungi.Rdata")
