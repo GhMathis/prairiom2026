@@ -1,0 +1,590 @@
+---
+title: "Bipartite SBM per Kingdom"
+author: "Mathis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache   = FALSE
+)
+```
+
+# Packages and helpers
+
+```{r packages}
+library(tidyverse)
+library(phyloseq)
+library(sbm)
+library(iNEXT.3D)
+library(patchwork)
+library(alluvial)
+
+source("scripts/plot_multipartite_sbm.R")
+source("scripts/functions_modified.R")
+```
+
+---
+
+# Data loading
+
+All four kingdoms are aggregated to the **grid level** (sampling unit: `YY_CAM_GG`).
+Grids 14 and 15 from 2021 are excluded throughout.
+
+## Bacteria
+
+```{r load-bacteria}
+load("outputs/clean_data_to_analise/ps_bacteria.Rdata")
+
+ps_bacteria_grid <- merge_samples(ps_bacteria, "grid") %>%
+  prune_samples(!str_detect(sample_names(.), "21-CAM-1[45]"), .)
+
+# OTU table: rows = OTUs, columns = grids
+ps_bacteria_grid %>%
+  otu_table() %>%
+  t() %>%
+  as.data.frame() %>%
+  rename_with(~str_replace_all(., "-", "_")) -> bacteria_grid_matrix
+
+# The column order of bacteria defines the reference sort for all other kingdoms
+reference_sample_sort <- colnames(bacteria_grid_matrix)
+
+cat("Bacteria grid matrix:", nrow(bacteria_grid_matrix), "OTUs x", ncol(bacteria_grid_matrix), "grids\n")
+```
+
+## Fungi
+
+```{r load-fungi}
+load("outputs/clean_data_to_analise/ps_fungi.Rdata")
+
+ps_fungi_grid <- merge_samples(ps_fungi, "grid_code") %>%
+  prune_samples(!str_detect(sample_names(.), "21_CAM_1[45]"), .)
+
+# Align columns to bacteria sort order
+ps_fungi_grid %>%
+  otu_table() %>%
+  t() %>%
+  as.data.frame() -> fungi_grid_matrix
+
+fungi_grid_matrix <- fungi_grid_matrix[, reference_sample_sort]
+
+cat("Fungi grid matrix:", nrow(fungi_grid_matrix), "OTUs x", ncol(fungi_grid_matrix), "grids\n")
+```
+
+## Viruses
+
+Virus data are at quadrat level; they are summed to grid level here.
+
+```{r load-virus}
+read.table("outputs/clean_data_to_analise/OTU_virus_CAM.txt", header = TRUE) %>%
+  mutate(grid_code = str_sub(Host_code, 1, 9)) %>%
+  filter(!str_detect(grid_code, "21_CAM_1[45]")) %>%
+  select(-Host_code) %>%
+  group_by(grid_code) %>%
+  summarise(across(where(is.numeric), sum)) %>%
+  column_to_rownames("grid_code") %>%
+  as.matrix() -> virus_grid_matrix
+
+# Align rows to reference sort
+virus_grid_matrix <- virus_grid_matrix[reference_sample_sort, ]
+
+cat("Virus grid matrix:", nrow(virus_grid_matrix), "grids x", ncol(virus_grid_matrix), "OTUs\n")
+```
+
+## Plants
+
+Plant abundances are already aggregated at grid level (quadrat cover × 2, summed).
+
+```{r load-plants}
+read.table("outputs/clean_data_to_analise/abund_plant_grid.txt", header = TRUE) %>%
+  column_to_rownames("Grid_code") %>%
+  as.matrix() -> plant_grid_matrix
+
+plant_grid_matrix <- plant_grid_matrix[reference_sample_sort, ]
+
+cat("Plant grid matrix:", nrow(plant_grid_matrix), "grids x", ncol(plant_grid_matrix), "OTUs\n")
+```
+
+## Metadata
+
+```{r load-metadata}
+read.table("outputs/clean_data_to_analise/Metadata_grid_CAM.txt", header = TRUE) -> metadata_grid
+cat("Metadata:", nrow(metadata_grid), "grids,", ncol(metadata_grid), "variables\n")
+```
+
+---
+
+# SBM at grid level
+
+## Read count truncation
+
+High sequencing depth inflates the matrix and slows SBM fitting.
+Reads are floored at 1/10 of their original value; zero-count entries are then
+dropped to keep the matrix sparse.
+
+```{r truncate-grid}
+truncate_matrix <- function(otu_mat, divisor = 10) {
+  otu_mat %>%
+    rownames_to_column("OTU") %>%
+    pivot_longer(-OTU, names_to = "sample", values_to = "reads") %>%
+    mutate(reads = floor(reads / divisor)) %>%
+    filter(reads > 0) %>%
+    pivot_wider(names_from = "sample", values_from = "reads", values_fill = 0) %>%
+    column_to_rownames("OTU")
+}
+
+bacteria_grid_truncated <- truncate_matrix(bacteria_grid_matrix)
+fungi_grid_truncated    <- truncate_matrix(fungi_grid_matrix)
+
+cat("After truncation — Bacteria:", nrow(bacteria_grid_truncated), "OTUs\n")
+cat("After truncation — Fungi   :", nrow(fungi_grid_truncated),    "OTUs\n")
+```
+
+## Coverage-based rarefaction
+
+### Minimum observed coverage per kingdom
+
+All samples within a kingdom are rarefied to the same coverage level — the
+minimum observed sample coverage — so that richness comparisons are not biased
+by sequencing depth.
+
+```{r coverage-bacteria}
+iNext_bact <- bacteria_grid_truncated %>%
+  iNEXT3D(q = 0, datatype = "abundance", nboot = 0)
+
+min_coverage_bact <- iNext_bact$TDiNextEst$coverage_based %>%
+  filter(Order.q == 0, Method == "Observed") %>%
+  slice_min(SC, n = 1) %>%
+  pull(SC)
+
+required_sizes_bact <- bacteria_grid_truncated %>%
+  estimate3D(level = min_coverage_bact, q = 0, nboot = 0) %>%
+  select(Assemblage, m)
+
+cat("Minimum sample coverage (bacteria):", round(min_coverage_bact, 3), "\n")
+```
+
+```{r coverage-fungi}
+iNext_fungi <- fungi_grid_truncated %>%
+  iNEXT3D(q = 0, datatype = "abundance", nboot = 0)
+
+min_coverage_fungi <- iNext_fungi$TDiNextEst$coverage_based %>%
+  filter(Order.q == 0, Method == "Observed") %>%
+  slice_min(SC, n = 1) %>%
+  pull(SC)
+
+required_sizes_fungi <- fungi_grid_truncated %>%
+  estimate3D(level = min_coverage_fungi, q = 0, nboot = 0) %>%
+  select(Assemblage, m)
+
+cat("Minimum sample coverage (fungi):", round(min_coverage_fungi, 3), "\n")
+```
+
+Comparison of target rarefaction sizes between bacteria and fungi:
+
+```{r coverage-comparison-plot, fig.width=5, fig.height=4}
+required_sizes_fungi %>%
+  left_join(required_sizes_bact, by = "Assemblage", suffix = c("_fungi", "_bact")) %>%
+  ggplot(aes(m_fungi, m_bact)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Target size (fungi)", y = "Target size (bacteria)") +
+  theme_bw()
+```
+
+### Rarefaction function
+
+The function samples `target_size` reads without replacement from each sample,
+repeating the process `n_sim` times. The per-OTU totals across simulations are
+then accumulated into a single matrix (effectively averaging over stochasticity).
+
+```{r rarefy-function}
+coverage_rarefy_matrix <- function(otu_matrix, required_sizes) {
+  sapply(colnames(otu_matrix), function(sample_name) {
+    sample_vector <- otu_matrix[, sample_name]
+    target_size <- required_sizes %>%
+      filter(Assemblage == sample_name) %>%
+      pull(m)
+
+    # Pool all reads as individual OTU tags, then draw without replacement
+    otu_pool    <- rep(rownames(otu_matrix), times = sample_vector)
+    sampled     <- sample(otu_pool, size = target_size, replace = FALSE)
+    rarefied    <- table(factor(sampled, levels = rownames(otu_matrix)))
+    as.numeric(rarefied)
+  }) %>%
+    `rownames<-`(rownames(otu_matrix)) %>%
+    as.data.frame() %>%
+    filter(rowSums(across(where(is.numeric))) != 0) %>%
+    as.matrix()
+}
+```
+
+### Simulation (n = 100)
+
+Each simulation draws a new rarefied matrix; the 100 matrices are stacked and
+summed per (OTU, sample) cell. OTUs present in fewer than 4 reads on average
+(i.e. total < 400 across simulations) are discarded as likely noise.
+
+```{r rarefy-grid, eval=FALSE}
+n_sim  <- 100
+set.seed(2365)
+
+accumulate_simulations <- function(sim_list, n_sim) {
+  sim_list %>%
+    map(~.x %>%
+          as.data.frame() %>%
+          rownames_to_column("OTU") %>%
+          pivot_longer(-OTU, names_to = "sample", values_to = "count")) %>%
+    reduce(full_join, by = c("OTU", "sample")) %>%
+    mutate(total = rowSums(across(starts_with("count")), na.rm = TRUE)) %>%
+    select(OTU, sample, total) %>%
+    pivot_wider(names_from = "sample", values_from = "total") %>%
+    column_to_rownames("OTU") %>%
+    as.matrix()
+}
+
+# Bacteria
+map(1:n_sim, ~coverage_rarefy_matrix(bacteria_grid_truncated,
+                                     required_sizes_bact)) -> bact_sim_list
+bact_grid_cumul <- accumulate_simulations(bact_sim_list, n_sim)
+# Keep OTUs with mean abundance > 3 (total > 3 * n_sim)
+bact_grid_rarefied <- bact_grid_cumul[rowSums(round(bact_grid_cumul / n_sim)) > 3, ]
+
+# Fungi
+map(1:n_sim, ~coverage_rarefy_matrix(fungi_grid_truncated,
+                                     required_sizes_fungi)) -> fungi_sim_list
+fungi_grid_cumul <- accumulate_simulations(fungi_sim_list, n_sim)
+fungi_grid_rarefied <- fungi_grid_cumul[rowSums(round(fungi_grid_cumul / n_sim)) > 3, ]
+
+cat("Retained OTUs — Bacteria:", nrow(bact_grid_rarefied),
+    "| Fungi:", nrow(fungi_grid_rarefied), "\n")
+
+# Sanity check: grid order must match across all kingdoms
+stopifnot(
+  all(colnames(bact_grid_rarefied) == colnames(fungi_grid_rarefied)),
+  all(colnames(fungi_grid_rarefied) == rownames(virus_grid_matrix)),
+  all(rownames(virus_grid_matrix)   == rownames(plant_grid_matrix))
+)
+```
+
+## SBM fitting
+
+Bipartite SBMs relate grids (row nodes) to OTUs (column nodes). The emission
+model is chosen per kingdom:
+
+- **Bacteria / Fungi**: Gaussian on log1p-transformed cumulated rarefied counts.
+- **Virus**: Poisson on raw counts (low read depth, integers well-behaved).
+- **Plants**: Gaussian on log1p-transformed abundance.
+
+Heavy computation blocks below are set to `eval = FALSE`; cached objects are
+loaded immediately after.
+
+### Bacteria
+
+```{r sbm-bacteria, eval=FALSE}
+sbm_Bact_gaussian <- estimateBipartiteSBM(
+  log1p(t(bact_grid_rarefied)),
+  model     = "gaussian",
+  dimLabels = c("grid", "bact")
+)
+save(sbm_Bact_gaussian, file = "outputs/heavy_computation_save/sbm_Bact_gaussian.Rdata")
+```
+
+```{r load-sbm-bacteria}
+load("outputs/heavy_computation_save/sbm_Bact_gaussian.Rdata")
+```
+
+### Fungi
+
+```{r sbm-fungi, eval=FALSE}
+sbm_Fungi_gaussian <- estimateBipartiteSBM(
+  log1p(t(fungi_grid_rarefied)),
+  model     = "gaussian",
+  dimLabels = c("grid", "fungi")
+)
+save(sbm_Fungi_gaussian, file = "outputs/heavy_computation_save/sbm_Fungi_gaussian.Rdata")
+```
+
+```{r load-sbm-fungi}
+load("outputs/heavy_computation_save/sbm_Fungi_gaussian.Rdata")
+```
+
+### Viruses
+
+```{r sbm-virus}
+sbm_Virus <- estimateBipartiteSBM(
+  virus_grid_matrix,
+  model     = "poisson",
+  dimLabels = c("grid", "virus")
+)
+```
+
+### Plants
+
+```{r sbm-plants}
+sbm_Plant <- estimateBipartiteSBM(
+  log1p(plant_grid_matrix),
+  model     = "gaussian",
+  dimLabels = c("grid", "plant")
+)
+```
+
+---
+
+# Results — grid level
+
+## Observed interaction matrices
+
+Each panel shows the sorted incidence/abundance matrix after SBM re-ordering,
+highlighting the block structure.
+
+```{r plot-observed, fig.width=14, fig.height=5}
+gg_bact  <- plot_bipartite_sbm(sbm_Bact_gaussian)
+gg_fungi <- plot_bipartite_sbm(sbm_Fungi_gaussian)
+gg_virus <- plot_bipartite_sbm(sbm_Virus)
+gg_plant <- plot_bipartite_sbm(sbm_Plant)
+
+wrap_plots(list(gg_bact, gg_fungi, gg_virus, gg_plant), nrow = 1)
+```
+
+## Expected interaction matrices
+
+The expected matrix (model reconstruction) smooths noise and makes the block
+structure explicit.
+
+```{r plot-expected, fig.width=14, fig.height=5}
+gg_bact_exp  <- plot_bipartite_sbm(sbm_Bact_gaussian, mat = sbm_Bact_gaussian$expectation)
+gg_fungi_exp <- plot_bipartite_sbm(sbm_Fungi_gaussian, mat = sbm_Fungi_gaussian$expectation)
+gg_virus_exp <- plot_bipartite_sbm(sbm_Virus,          mat = sbm_Virus$expectation)
+gg_plant_exp <- plot_bipartite_sbm(sbm_Plant,          mat = sbm_Plant$expectation)
+
+wrap_plots(list(gg_bact_exp, gg_fungi_exp, gg_virus_exp, gg_plant_exp), nrow = 1)
+```
+
+## Average block signal per kingdom
+
+```{r plot-avg-blocks, fig.width=10, fig.height=4}
+sbm_Bact_avg  <- plot_bipartite_sbm_avg(sbm_Bact_gaussian)
+sbm_Fungi_avg <- plot_bipartite_sbm_avg(sbm_Fungi_gaussian)
+
+sbm_Bact_avg$plot
+sbm_Fungi_avg$plot
+```
+
+## Cross-kingdom block co-membership (alluvial)
+
+Each grid is assigned to one block per kingdom. The alluvial diagram shows how
+the same grids cluster across bacteria, fungi, viruses and plants — revealing
+whether ecological units are conserved or kingdom-specific.
+
+```{r alluvial-plot, fig.width=10, fig.height=6}
+# Sanity check: all SBMs operate on the same grid ordering
+stopifnot(
+  all(rownames(sbm_Bact_gaussian$networkData) == rownames(sbm_Fungi_gaussian$networkData)),
+  all(rownames(sbm_Fungi_gaussian$networkData) == rownames(sbm_Virus$networkData)),
+  all(rownames(sbm_Virus$networkData)          == rownames(sbm_Plant$networkData))
+)
+
+# Build contingency table of block co-memberships
+B_multi_regne <- as.data.frame(table(
+  grid  = rownames(sbm_Bact_gaussian$networkData),
+  Bact  = sbm_Bact_gaussian$memberships$grid,
+  Fungi = sbm_Fungi_gaussian$memberships$grid,
+  Virus = sbm_Virus$memberships$grid,
+  Plant = sbm_Plant$memberships$grid
+)) %>%
+  filter(Freq != 0)
+
+alluvial(
+  B_multi_regne[, c("Bact", "Fungi", "Virus", "Plant")],
+  freq     = B_multi_regne$Freq,
+  alpha    = 0.7,
+  cex      = 1.5,
+  cex.axis = 1.5,
+  xw       = 0.2
+)
+```
+
+---
+
+# SBM at quadrat level (exploratory)
+
+This section is work in progress. The goal is to run per-kingdom bipartite SBMs
+at the finer quadrat scale (`YY_CAM_GG_QQ`) instead of the grid scale.
+
+## Bacteria
+
+### Data preparation
+
+```{r quadra-bact-load}
+# Retain only non-excluded quadrats, then truncate read depth (÷ 10)
+ps_bacteria_quadra <- ps_bacteria %>%
+  prune_samples(!str_detect(sample_names(.), "21-CAM-1[45]"), .)
+
+cat("Quadrats available:", nsamples(ps_bacteria_quadra), "\n")
+
+ps_bacteria_quadra %>%
+  otu_table() %>%
+  as.data.frame() %>%
+  rename_with(~str_replace_all(., "-", "_")) %>%
+  rename_with(~substring(., 1, 13)) -> bacteria_quadra_matrix
+
+bacteria_quadra_truncated <- bacteria_quadra_matrix %>%
+  rownames_to_column("OTU") %>%
+  pivot_longer(-OTU, names_to = "quadra_code", values_to = "reads") %>%
+  mutate(reads = floor(reads / 10)) %>%
+  filter(reads > 0) %>%
+  pivot_wider(names_from = "quadra_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU")
+
+cat("After truncation:", nrow(bacteria_quadra_truncated), "OTUs x",
+    ncol(bacteria_quadra_truncated), "quadrats\n")
+```
+
+### Read depth distribution
+
+```{r quadra-bact-depth, fig.width=6, fig.height=4}
+tibble(
+  quadra  = colnames(bacteria_quadra_truncated),
+  log10_reads = log10(colSums(bacteria_quadra_truncated))
+) %>%
+  arrange(log10_reads) %>%
+  mutate(rank = row_number()) %>%
+  ggplot(aes(rank, log10_reads)) +
+  geom_point() +
+  geom_hline(yintercept = log10(4), linetype = "dashed", colour = "red") +
+  labs(x = "Quadrat rank", y = "log10(total reads)",
+       title = "Read depth after truncation — quadrat level") +
+  theme_bw()
+```
+
+### Low-coverage quadrat removal
+
+Quadrats with sample coverage < 0.8 are removed before rarefaction to avoid
+extrapolation artefacts.
+
+```{r quadra-bact-coverage}
+# Remove quadrats with fewer than 4 total reads after truncation
+bacteria_quadra_truncated <- bacteria_quadra_truncated %>%
+  rownames_to_column("OTU") %>%
+  pivot_longer(-OTU, names_to = "quadra_code", values_to = "reads") %>%
+  group_by(quadra_code) %>%
+  filter(sum(reads) > 4) %>%
+  ungroup() %>%
+  pivot_wider(names_from = "quadra_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU")
+
+iNext_bact_quadra <- bacteria_quadra_truncated %>%
+  iNEXT3D(q = 0, datatype = "abundance", nboot = 0)
+
+# Identify quadrats below coverage threshold
+low_coverage_quadrats <- iNext_bact_quadra$TDiNextEst$coverage_based %>%
+  filter(Order.q == 0, Method == "Observed", SC < 0.8) %>%
+  pull(Assemblage)
+
+cat("Quadrats removed (coverage < 0.8):", length(low_coverage_quadrats), "\n")
+
+bacteria_quadra_filtered <- bacteria_quadra_truncated %>%
+  rownames_to_column("OTU") %>%
+  pivot_longer(-OTU, names_to = "quadra_code", values_to = "reads") %>%
+  filter(!(quadra_code %in% low_coverage_quadrats), reads > 0) %>%
+  pivot_wider(names_from = "quadra_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU")
+
+cat("Remaining quadrats:", ncol(bacteria_quadra_filtered), "\n")
+```
+
+### Coverage-based rarefaction
+
+```{r quadra-bact-rarefy-prep}
+min_coverage_bact_quadra <- iNext_bact_quadra$TDiNextEst$coverage_based %>%
+  filter(Order.q == 0, Method == "Observed", SC > 0.8) %>%
+  slice_min(SC, n = 1) %>%
+  pull(SC)
+
+required_sizes_bact_quadra <- bacteria_quadra_filtered %>%
+  estimate3D(level = min_coverage_bact_quadra, q = 0, nboot = 0) %>%
+  select(Assemblage, m)
+
+cat("Minimum coverage used for rarefaction:", round(min_coverage_bact_quadra, 3), "\n")
+```
+
+```{r quadra-bact-rarefy-sim, eval=FALSE}
+n_sim  <- 100
+set.seed(2365)
+
+map(1:n_sim, ~coverage_rarefy_matrix(bacteria_quadra_filtered,
+                                     required_sizes_bact_quadra)) -> quadra_bact_sim_list
+
+quadra_bact_sim_list %>%
+  map(~.x %>%
+        as.data.frame() %>%
+        rownames_to_column("OTU") %>%
+        pivot_longer(-OTU, names_to = "sample", values_to = "count")) %>%
+  reduce(full_join, by = c("OTU", "sample")) %>%
+  mutate(total = round(rowSums(across(starts_with("count")), na.rm = TRUE) / n_sim)) %>%
+  filter(total > 0) %>%
+  select(OTU, sample, total) %>%
+  pivot_wider(names_from = "sample", values_from = "total", values_fill = 0) %>%
+  column_to_rownames("OTU") %>%
+  as.matrix() -> quadra_bact_rarefied
+
+cat("Retained OTUs:", nrow(quadra_bact_rarefied),
+    "| Quadrats:", ncol(quadra_bact_rarefied), "\n")
+```
+
+### SBM fitting
+
+```{r sbm-bact-quadra, eval=FALSE}
+sbm_Bact_quadra_gaussian <- estimateBipartiteSBM(
+  log1p(t(quadra_bact_rarefied)),
+  model     = "gaussian",
+  dimLabels = c("quadra", "bact")
+)
+save(sbm_Bact_quadra_gaussian,
+     file = "outputs/heavy_computation_save/sbm_Bact_quadra_gaussian.Rdata")
+```
+
+```{r load-sbm-bact-quadra}
+load("outputs/heavy_computation_save/sbm_Bact_quadra_gaussian.Rdata")
+plot_bipartite_sbm(sbm_Bact_quadra_gaussian)
+```
+
+## Fungi (work in progress)
+
+Fungi at the quadrat level are truncated with a divisor of 5 (shallower
+sequencing than bacteria) before coverage estimation.
+
+```{r quadra-fungi-prep}
+ps_fungi_quadra <- ps_fungi %>%
+  prune_samples(!str_detect(sample_names(.), "21-CAM-1[45]"), .)
+
+ps_fungi_quadra %>%
+  otu_table() %>%
+  as.data.frame() %>%
+  rename_with(~str_replace_all(., "-", "_")) -> fungi_quadra_matrix
+
+fungi_quadra_truncated <- fungi_quadra_matrix %>%
+  rownames_to_column("OTU") %>%
+  pivot_longer(-OTU, names_to = "quadra_code", values_to = "reads") %>%
+  mutate(reads = floor(reads / 5)) %>%
+  filter(reads > 0) %>%
+  pivot_wider(names_from = "quadra_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU")
+
+cat("Fungi quadrat matrix after truncation:", nrow(fungi_quadra_truncated), "OTUs x",
+    ncol(fungi_quadra_truncated), "quadrats\n")
+```
+
+> **Note:** Coverage estimation and SBM fitting for fungi at the quadrat level
+> mirror the bacteria workflow above and are pending implementation.
