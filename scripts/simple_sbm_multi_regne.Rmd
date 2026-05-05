@@ -140,7 +140,10 @@ truncate_matrix <- function(otu_mat, divisor = 10) {
     mutate(reads = floor(reads / divisor)) %>%
     filter(reads > 0) %>%
     pivot_wider(names_from = "sample", values_from = "reads", values_fill = 0) %>%
-    column_to_rownames("OTU")
+    column_to_rownames("OTU") %>%
+    # pivot_wider reorders columns based on first appearance after filtering;
+    # restore the original column order explicitly
+    .[, colnames(otu_mat)]
 }
 
 bacteria_grid_truncated <- truncate_matrix(bacteria_grid_matrix)
@@ -292,12 +295,14 @@ loaded immediately after.
 ### Bacteria
 
 ```{r sbm-bacteria, eval=FALSE}
-sbm_Bact_gaussian <- estimateBipartiteSBM(
+if(!file.exist("outputs/heavy_computation_save/sbm_Bact_gaussian.Rdata")){
+  sbm_Bact_gaussian <- estimateBipartiteSBM(
   log1p(t(bact_grid_rarefied)),
   model     = "gaussian",
   dimLabels = c("grid", "bact")
 )
 save(sbm_Bact_gaussian, file = "outputs/heavy_computation_save/sbm_Bact_gaussian.Rdata")
+}
 ```
 
 ```{r load-sbm-bacteria}
@@ -307,12 +312,14 @@ load("outputs/heavy_computation_save/sbm_Bact_gaussian.Rdata")
 ### Fungi
 
 ```{r sbm-fungi, eval=FALSE}
+if(!file.exist("outputs/heavy_computation_save/sbm_Fungi_gaussian.Rdata")){
 sbm_Fungi_gaussian <- estimateBipartiteSBM(
   log1p(t(fungi_grid_rarefied)),
   model     = "gaussian",
   dimLabels = c("grid", "fungi")
 )
 save(sbm_Fungi_gaussian, file = "outputs/heavy_computation_save/sbm_Fungi_gaussian.Rdata")
+}
 ```
 
 ```{r load-sbm-fungi}
