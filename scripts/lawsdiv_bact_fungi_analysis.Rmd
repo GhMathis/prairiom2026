@@ -1,0 +1,503 @@
+---
+title: "Laws of diversity and variation — bacteria & fungi"
+output: html_document
+date: "2026-05-05"
+---
+
+This Rmd applies the framework of Grilli (2020) "Laws of diversity and variation
+in microbial communities" (`jacopogrilli/lawsdiv`) to the prairiom2026
+cross-sectional grid-level data, treating **bacteria (16S)** and **fungi (ITS2)**
+as the two "environments" that replace the ten environments of the original paper.
+We adapt only the cross-sectional part of `EstimatePars.R` (no longitudinal data
+here, no host-specific stratification, no 10-environment correlation matrix).
+
+# Load packages
+
+```{r setup, message = FALSE, warning = FALSE}
+library(tidyverse)     # data wrangling
+library(ggfortify)     # lawsdiv dep
+library(lamW)          # Lambert W (lawsdiv dep)
+library(GGally)        # lawsdiv dep
+library(ggcorrplot)    # lawsdiv dep
+library(pracma)        # erfc, used by fun_erf / estimatemean_f
+library(phyloseq)      # to read ps_bacteria.Rdata / ps_fungi.Rdata
+library(scales)        # for fancy labellers used in mytheme
+library(RColorBrewer)
+```
+
+# Define theme and core estimators inline
+
+We use the project's `main_theme` (matched to other plotting scripts in
+`scripts/`) instead of sourcing lawsdiv's `ggplot_mytheme.R` — the latter
+hard-codes `family = "Helvetica"`, which is not in the Windows font database
+and produces hundreds of warnings per knit. The parameter-estimation
+helpers (`fun_erf`, `estimatemean_f`, `simple_par`) are copied verbatim from
+`scripts/lawsdiv/Code/EstimatePars.R`. `fancy_scientific` is the lawsdiv
+helper used by the AFD-plot y-axis labeller.
+
+```{r lawsdiv-helpers}
+## --- project plotting theme (matches scripts/3_plant_community_structure.R) ---
+main_theme <- theme_minimal() +
+  theme(line = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.border = element_blank(),
+        axis.ticks = element_line(colour = "black"),
+        axis.text.x = element_text(colour = "black", size = 22),
+        axis.text.y = element_text(colour = "black", size = 22),
+        legend.title = element_text(colour = "black", size = 20, hjust = 0.5),
+        legend.text = element_text(colour = "black", size = 18),
+        axis.title = element_text(size = 28),
+        strip.text = element_text(colour = "black", size = 15, face = "italic"))
+
+## --- copied from scripts/lawsdiv/Code/EstimatePars.R ---------------------
+## erfc-based equation whose root gives the lognormal mean estimate
+fun_erf <- function(mu, c, m1, m2) {
+  sigma <- sqrt(-c * m1 + m2 + c * mu - m1 * mu)
+  x <- (c - mu) / sigma / sqrt(2)
+  f <- (mu - m1) * erfc(x) + exp(-x^2) * sqrt(2 / pi) * sigma
+  return(f)
+}
+
+## solve fun_erf == 0 for mu, given threshold c and the first two moments of
+## log(f) above c
+estimatemean_f <- function(c, m1, m2) {
+  mumin <- (c * m1 - m2) / (c - m1)
+  muest <- uniroot(fun_erf, c = c, m1 = m1, m2 = m2,
+                   interval = c(-50, mumin - 0.001), tol = 0.0001)$root
+  return(muest)
+}
+
+## reference parabola for the rescaled MAD plot (lognormal in log-space)
+simple_par <- function(x) { -x^2 }
+
+## copied from scripts/lawsdiv/Code/ggplot_mytheme.R — used by the AFD y-axis
+fancy_scientific <- function(l) {
+  l <- format(l, scientific = TRUE)
+  l <- gsub("e\\+00", "", l)
+  l <- gsub("^(.*)e", "'\\1'e", l)
+  l <- gsub("'1'e", "10^", l)
+  l <- gsub("e", "%*%10^", l)
+  l <- gsub("\\+", "", l)
+  parse(text = l)
+}
+```
+
+# Load and aggregate data
+
+We load both phyloseq objects, aggregate samples (quadrats) to grid level with
+`merge_samples`, and drop the 2021 grids 14/15 — intentionally excluded
+project-wide (see `CLAUDE.md`). After `merge_samples`, bacteria sample names
+use `-` as separator while fungi sample names keep `_`, hence the two regex
+variants.
+
+```{r load-data}
+load("outputs/clean_data_to_analise/ps_bacteria.Rdata")
+load("outputs/clean_data_to_analise/ps_fungi.Rdata")
+
+ps_bacteria_grid <- merge_samples(ps_bacteria, "grid") %>%
+  prune_samples(!str_detect(sample_names(.), "21-CAM-1[45]"), .)
+
+ps_fungi_grid <- merge_samples(ps_fungi, "grid_code") %>%
+  prune_samples(!str_detect(sample_names(.), "21_CAM_1[45]"), .)
+
+cat("Bacteria grid-level phyloseq:\n"); print(ps_bacteria_grid)
+cat("\nFungi grid-level phyloseq:\n"); print(ps_fungi_grid)
+```
+
+```{r extract-otu-tables}
+## Samples in columns, taxa in rows — same orientation as
+## copartnership_bacteria_analysis.Rmd. After merge_samples, otu_table is
+## samples-by-taxa, so we transpose.
+bacteria_grid_df <- ps_bacteria_grid %>% otu_table() %>% t() %>% as.data.frame()
+fungi_grid_df    <- ps_fungi_grid    %>% otu_table() %>% t() %>% as.data.frame()
+cat("bacteria_grid_df: ", dim(bacteria_grid_df), "\n")
+cat("fungi_grid_df:    ", dim(fungi_grid_df),    "\n")
+```
+
+# Build datatax (lawsdiv long format)
+
+`EstimatePars.R` expects a long data frame with columns
+`project_id, classification, otu_id, run_id, nreads, count`. Here:
+
+- `project_id`     = `"prairiom2026"`
+- `classification` = `"bacteria"` or `"fungi"` (the two environments)
+- `otu_id`         = OTU/ASV row name
+- `run_id`         = grid code (sample after merge)
+- `count`          = integer reads for that OTU in that grid
+- `nreads`         = column sum of counts across all OTUs in that grid
+
+We compute `nreads` per `(classification, run_id)` from the wide matrix
+**before** dropping zeros, then `pivot_longer` and join. We then filter
+`count > 0` so only present OTUs occupy rows — this matches the effective
+behaviour of `count > count_cutoff` with `count_cutoff = 0` in the original
+script.
+
+```{r build-datatax}
+to_long <- function(wide_df, classification) {
+  nreads_per_run <- tibble(
+    run_id = colnames(wide_df),
+    nreads = colSums(wide_df)
+  )
+  wide_df %>%
+    rownames_to_column("otu_id") %>%
+    pivot_longer(-otu_id, names_to = "run_id", values_to = "count") %>%
+    mutate(
+      project_id     = "prairiom2026",
+      classification = classification,
+      count          = as.integer(round(count))
+    ) %>%
+    left_join(nreads_per_run, by = "run_id") %>%
+    select(project_id, classification, otu_id, run_id, nreads, count)
+}
+
+datatax <- bind_rows(
+  to_long(bacteria_grid_df, "bacteria"),
+  to_long(fungi_grid_df,    "fungi")
+) %>%
+  filter(count > 0)
+
+cat("datatax dimensions: ", dim(datatax), "\n")
+head(datatax)
+
+datatax %>%
+  group_by(classification) %>%
+  summarise(n_runs = n_distinct(run_id),
+            n_otus = n_distinct(otu_id),
+            mean_nreads = mean(nreads),
+            median_nreads = median(nreads)) %>%
+  print()
+```
+
+# Filter and compute proj (per-OTU statistics)
+
+We apply lawsdiv's mild cross-sectional cutoffs (`nreads > 10^1`) and compute
+per-OTU statistics: occupancy `o` (fraction of grids where the OTU is present),
+mean relative abundance `f` and variance `vf` of relative abundance across
+grids. The block below is structurally identical to lines ~28-33 of
+`EstimatePars.R`. We assign `sname = classification` directly (no `shortnames`
+lookup — only two kingdoms here) and tag `scat` for downstream
+classification-aware plots if needed.
+
+```{r compute-proj}
+nreads_cutoff <- 10^1
+count_cutoff  <- 0
+
+summarydata <- datatax %>%
+  filter(nreads > nreads_cutoff) %>%
+  group_by(project_id, classification) %>%
+  summarise(n_of_runs = n_distinct(run_id),
+            mean_nreads = mean(nreads), .groups = "drop") %>%
+  filter(n_of_runs > 0) %>%
+  mutate(idall = paste(project_id, classification))
+print(summarydata)
+
+datatax <- datatax %>%
+  filter(paste(project_id, classification) %in%
+         paste(summarydata$project_id, summarydata$classification))
+
+proj <- datatax %>%
+  filter(nreads > nreads_cutoff, count > count_cutoff) %>%
+  group_by(project_id, classification, otu_id) %>%
+  mutate(tf   = mean(count / nreads),
+         o    = n(),
+         tvpf = mean((count^2 - count) / nreads^2)) %>%
+  ungroup() %>%
+  group_by(project_id, classification) %>%
+  mutate(o = o / n_distinct(run_id)) %>%
+  mutate(f = o * tf, vf = o * tvpf) %>%
+  mutate(vf = vf - f^2) %>%
+  ungroup() %>%
+  mutate(idall = paste(project_id, classification),
+         sname = classification,
+         scat  = classification) %>%
+  select(-tf, -tvpf)
+
+cat("proj dimensions: ", dim(proj), "\n")
+head(proj)
+summary(proj %>% select(o, f, vf))
+```
+
+# Gamma parameters (Abundance Fluctuation Distribution)
+
+The Grilli framework predicts a Gamma AFD across samples, parameterised by
+shape `beta = 1 / cv^2` (with `cv^2 = vf / f^2`) and scale `theta = f / beta`.
+
+```{r gamma-pars}
+gamma_pars <- proj %>%
+  select(idall, sname, otu_id, o, f, vf) %>%
+  mutate(cv = sqrt(vf / f^2)) %>%
+  distinct() %>%
+  mutate(beta = 1 / cv^2, theta = f / beta)
+
+cat("gamma_pars dimensions: ", dim(gamma_pars), "\n")
+head(gamma_pars)
+
+gamma_pars %>%
+  group_by(sname) %>%
+  summarise(n_otu = n(),
+            n_with_var = sum(vf > 0, na.rm = TRUE),
+            median_beta = median(beta[vf > 0], na.rm = TRUE)) %>%
+  print()
+```
+
+# Taylor's law plot
+
+Taylor's law states `Var(f) ~ <f>^2`. We plot it per kingdom (with the slope-2
+reference line) and overlay binned means in the style of `Fig1.R`.
+
+```{r taylor-plot, fig.width = 10, fig.height = 5}
+dir.create("outputs/figures", showWarnings = FALSE, recursive = TRUE)
+
+nbins <- 15
+taylor_binnes <- gamma_pars %>%
+  filter(f > 0, vf > 0) %>%
+  group_by(idall, sname) %>%
+  mutate(lf = log(f), dlf = (max(lf) - min(lf)) / nbins) %>%
+  mutate(b = as.integer((lf - min(lf)) / dlf)) %>%
+  ungroup() %>%
+  group_by(idall, sname, b) %>%
+  summarise(vf = mean(vf), f = mean(f), .groups = "drop") %>%
+  mutate(xx = runif(n())) %>%
+  arrange(xx)
+
+ptaylor_ind <- gamma_pars %>%
+  filter(f > 0, vf > 0) %>%
+  ggplot() + main_theme +
+  aes(x = f, y = vf) +
+  geom_abline(slope = 2, size = 1.2) +
+  geom_point(size = 0.8, alpha = 0.4, color = "gray40") +
+  geom_point(data = taylor_binnes,
+             aes(x = f, y = vf, color = as.factor(sname),
+                 shape = as.factor(sname)),
+             size = 3, stroke = 1.2) +
+  scale_x_log10("Average relative abundance") +
+  scale_y_log10("Variance of relative abundance across grids") +
+  theme(legend.position = "none") +
+  facet_wrap(~ sname, scales = "free")
+ptaylor_ind
+
+ts <- format(Sys.time(), "%Y%m%d_%H%M%S")
+# ggsave(filename = sprintf("outputs/figures/lawsdiv_taylor_%s.pdf", ts),
+#        plot = ptaylor_ind, width = 10, height = 5)
+```
+
+# MAD parameters (Mean Abundance Distribution)
+
+We now estimate the lognormal-tail parameters `(mu, sigma)` of the MAD on the
+log of the mean abundance `f`, restricted to OTUs above a kingdom-specific
+cutoff `c`. The original paper hand-tunes `c` per environment; here we use a
+**principled heuristic**: for each kingdom, `c = quantile(log(f), 0.25)` —
+the 25th-percentile of `log(f)`. This excludes the rarest OTUs whose mean
+estimates are noise-dominated, without arbitrary tuning. Manual tuning is
+likely needed if the parabola fit looks bad on either kingdom (see prose
+note below).
+
+```{r mad-cutoffs}
+nbin <- 20
+
+cutoffs <- gamma_pars %>%
+  filter(f > 0) %>%
+  group_by(sname) %>%
+  summarise(c = as.numeric(quantile(log(f), 0.25)), .groups = "drop")
+cutoffs
+
+estimate_mean <- gamma_pars %>%
+  filter(f > 0) %>%
+  mutate(lf = log(f)) %>%
+  left_join(cutoffs, by = "sname") %>%
+  ungroup() %>%
+  filter(lf > c) %>%
+  group_by(idall, sname) %>%
+  summarise(c     = mean(c),
+            m1    = mean(lf),
+            m2    = mean(lf^2),
+            ns_obs = n_distinct(otu_id),
+            nf    = sum(f),
+            .groups = "drop") %>%
+  rowwise() %>%
+  mutate(mu    = estimatemean_f(c, m1, m2),
+         sigma = sqrt(-c * m1 + m2 + c * mu - m1 * mu)) %>%
+  ungroup() %>%
+  as.data.frame() %>%
+  mutate(stot = 2 * ns_obs / erfc((c - mu) / sigma / sqrt(2)))
+
+estimate_mean
+```
+
+> **Note** — the cutoff heuristic above (`q25 of log(f)`) is a defensible
+> default, not a final choice. The original paper tunes `c` by eye per
+> environment (e.g. `c = -14.27` for `gut1`, `c = -18.8` for `sludge`). If
+> the rescaled-MAD points below visibly deviate from the `-x^2` parabola in
+> either kingdom, revisit `cutoffs` and pick a stricter quantile (e.g. 0.5
+> or 0.75) or hand-set values per kingdom.
+
+# Rescaled MAD plot (parabola)
+
+We bin `log(f)` into `nbin = 20` bins per kingdom, compute the empirical
+density `p`, then plot the lawsdiv rescaling: `(lf - mu) / sqrt(2 sigma^2)`
+on x and `p / [0.5 * erfc((mu-c)/sqrt(2)/sigma)] * sqrt(2 pi)` on a log y.
+A perfect lognormal collapses on the parabola `y = -x^2` (in log10 units).
+
+```{r mad-plot, fig.width = 10, fig.height = 5}
+statp <- gamma_pars %>%
+  filter(f > 0) %>%
+  mutate(lf = log(f), cutoff = -100) %>%
+  group_by(idall) %>%
+  mutate(df = (max(lf) - min(lf)) / nbin) %>%
+  mutate(b = as.integer((lf - min(lf)) / df)) %>%
+  ungroup() %>%
+  group_by(idall, b, df) %>%
+  summarise(lf = mean(lf), cutoff = mean(cutoff), n = n(), .groups = "drop") %>%
+  group_by(idall) %>%
+  mutate(p = n / sum(n) / df) %>%
+  ungroup()
+
+p_mad <- statp %>%
+  mutate(xx = runif(nrow(statp))) %>%
+  filter(lf > cutoff) %>%
+  left_join(estimate_mean, by = "idall") %>%
+  arrange(xx, sname) %>%
+  ggplot() + main_theme +
+  stat_function(fun = simple_par, color = "black", size = 1) +
+  aes(
+    x = (lf - mu) / sqrt(2 * sigma^2),
+    y = 10^(log(p) - log(0.5 * erfc((mu - c) / sqrt(2) / sigma)) +
+            0.5 * log(2 * pi)),
+    color = as.factor(sname),
+    shape = as.factor(sname)
+  ) +
+  geom_point(size = 3, stroke = 1) +
+  geom_vline(aes(xintercept = (c - mu) / sqrt(2 * sigma^2))) +
+  geom_vline(aes(xintercept = 0)) +
+  scale_x_continuous("Rescaled log average abundance") +
+  scale_y_log10("Fraction of species") +
+  theme(legend.position = "none") +
+  facet_wrap(~ sname)
+p_mad
+
+# ggsave(filename = sprintf("outputs/figures/lawsdiv_mad_%s.pdf", ts),
+#        plot = p_mad, width = 10, height = 5)
+```
+
+# AFD plot (Gamma fluctuations across grids)
+
+For OTUs present in nearly all grids (`o > 0.999`), we compute the per-OTU
+standardised log relative abundance `(log(f_i) - mean) / sd` across grids,
+bin it, and overlay the predicted Gamma curve `gammalog(x; k)` from `Fig1.R`
+(with `k = 1.7`, the empirical mean shape from the paper). The lognormal
+reference (`-x^2 - log10(2 pi) / 2 + log10(e)`) is plotted as a dashed line
+for comparison.
+
+```{r afd-plot, fig.width = 10, fig.height = 5}
+gammalog <- function(x, k = 1.7) {
+  (k * trigamma(k) * x - exp(sqrt(trigamma(k)) * x + digamma(k))) -
+    log(gamma(k)) + k * digamma(k) + log10(exp(1))
+}
+lognlog <- function(x) { -x^2 - log10(2 * pi) / 2 + log10(exp(1)) }
+
+nbin_afd <- 20
+dh <- proj %>%
+  filter(o > 0.999, nreads > 0, count > 0) %>%
+  mutate(l = log(count / nreads), f_inst = count / nreads) %>%
+  group_by(otu_id, idall, sname) %>%
+  mutate(ml = mean(l), sl = sd(l),
+         k  = mean(f_inst)^2 / var(f_inst)) %>%
+  ungroup() %>%
+  filter(!is.na(sl), sl > 0) %>%
+  mutate(lf = (l - ml) / sl) %>%
+  group_by(idall, sname) %>%
+  mutate(df = (max(lf) - min(lf)) / nbin_afd) %>%
+  mutate(b  = as.integer((lf - min(lf)) / df)) %>%
+  ungroup() %>%
+  group_by(idall, b, df, sname) %>%
+  summarise(lf = mean(lf), n = n(), k = mean(k, na.rm = TRUE),
+            .groups = "drop") %>%
+  group_by(idall) %>%
+  mutate(p = n / sum(n) / df) %>%
+  ungroup()
+
+cat("dh dimensions (binned standardised AFD points): ", dim(dh), "\n")
+
+p_afd <- dh %>%
+  arrange(sname) %>%
+  ggplot() + main_theme +
+  stat_function(fun = lognlog, color = "black", size = 1, linetype = "dashed") +
+  stat_function(fun = gammalog, color = "black", size = 1) +
+  aes(
+    x = lf / sqrt(2),
+    y = 10^(log10(p)),
+    color = as.factor(sname),
+    shape = as.factor(sname)
+  ) +
+  geom_point(size = 3, stroke = 1.3) +
+  scale_x_continuous("Rescaled log relative abundance") +
+  scale_y_log10("Probability density", labels = fancy_scientific) +
+  theme(legend.position = "none") +
+  facet_wrap(~ sname)
+p_afd
+
+# ggsave(filename = sprintf("outputs/figures/lawsdiv_afd_%s.pdf", ts),
+#        plot = p_afd, width = 10, height = 5)
+```
+
+If `dh` is empty (no OTU present in essentially every grid), the AFD plot
+above will not render meaningful points — likely with only ~40 grids per
+kingdom and the strict `o > 0.999` filter. In that case relax the filter
+(e.g. `o > 0.5`) or reduce `nbin_afd`; we keep the strict filter here to
+match the original paper's figure.
+
+# Mean parameters table
+
+`mean_pars` collects per-kingdom MAD parameters together with the mean Gamma
+shape `mbeta` (averaged over OTUs with `f > 1e-5` and `vf > 0`). This is the
+final summary table consumed downstream.
+
+```{r mean-pars}
+mean_pars <- estimate_mean %>%
+  select(idall, sname, nf, c, mu, sigma, stot) %>%
+  left_join(
+    gamma_pars %>%
+      filter(f > 1e-5, vf > 0) %>%
+      group_by(sname) %>%
+      summarise(mbeta = mean(beta), .groups = "drop"),
+    by = "sname"
+  )
+
+mean_pars
+```
+
+# Save fitted parameters
+
+We persist `proj`, `gamma_pars`, `mean_pars`, `cutoffs`, `estimate_mean`,
+`statp` to `outputs/heavy_computation_save/`. Per `CLAUDE.md`, we never
+overwrite an existing `.Rdata` file: if the canonical path already exists,
+we save under a timestamped name and warn the user via the console.
+
+```{r save-pars}
+dir.create("outputs/heavy_computation_save", showWarnings = FALSE,
+           recursive = TRUE)
+
+out_path  <- "outputs/heavy_computation_save/lawsdiv_bact_fungi.Rdata"
+out_stamp <- sprintf(
+  "outputs/heavy_computation_save/lawsdiv_bact_fungi_%s.Rdata",
+  format(Sys.time(), "%Y%m%d_%H%M%S")
+)
+
+if (file.exists(out_path)) {
+  message("** ", out_path, " already exists — saving under stamped name to ",
+          "avoid overwrite (per CLAUDE.md). New file: ", out_stamp)
+  save(proj, gamma_pars, mean_pars, cutoffs, estimate_mean, statp,
+       file = out_stamp)
+  cat("Saved to: ", out_stamp, "\n")
+} else {
+  save(proj, gamma_pars, mean_pars, cutoffs, estimate_mean, statp,
+       file = out_path)
+  cat("Saved to: ", out_path, "\n")
+}
+```
+
+# Session info
+
+```{r sessioninfo}
+sessionInfo()
+```

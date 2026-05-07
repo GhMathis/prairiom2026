@@ -305,10 +305,10 @@ plot_bipartite_sbm(sbm_Fungi_bin)
 
 
 
-sbm_Fungi_gaussian <- estimateBipartiteSBM(log1p(t(test3_fungi)),
-                       model = "gaussian",
-                       dimLabels = c("grid", "fungi"))
-save(sbm_Fungi_gaussian, file = "outputs/heavy_computation_save/sbm_Fungi_gaussian.Rdata")
+# sbm_Fungi_gaussian <- estimateBipartiteSBM(log1p(t(test3_fungi)),
+#                        model = "gaussian",
+#                        dimLabels = c("grid", "fungi"))
+# save(sbm_Fungi_gaussian, file = "outputs/heavy_computation_save/sbm_Fungi_gaussian.Rdata")
 load(file = "outputs/heavy_computation_save/sbm_Fungi_gaussian.Rdata")
 plot_bipartite_sbm(sbm_Fungi_gaussian)
 
@@ -380,7 +380,7 @@ alluvial(B_multi_regne[, c(2, 3, 4, 5)],
 
 
 sbm_Bact_gaussian$memberships$grid -> row_cluster
-unique(sbsbm_Bact_gaussian$memberships$bact) -> col_cluster
+unique(sbm_Bact_gaussian$memberships$bact) -> col_cluster
 sbm_Bact_gaussian -> bsbm
 
 str(sbm_Bact_gaussian)
@@ -398,6 +398,7 @@ sbm_Bact_gaussian$expectation %>%
   pivot_wider(names_from = "cluster", values_from = "log_expected_reads") %>% 
   column_to_rownames("grid") %>%
   as.matrix %>% str
+
 plot_bipartite_sbm(sbm_Bact_gaussian, mat = sbm_Bact_gaussian$expectation)
 
 plot_bipartite_sbm_avg(sbm_Bact_gaussian) -> sbm_Bact_average
@@ -436,13 +437,15 @@ bacteria_quadra_matrix %>%
   filter(log10(sum(reads))> 2.5) %>%
   ungroup() %>%
   pivot_wider(names_from = "quadra_code", values_from = "reads", values_fill = 0) %>%
-  column_to_rownames("OTU") -> bacteria_quadra__filter_matrix
-dim(bacteria_quadra__filter_matrix)
-plot(1:dim(bacteria_quadra__filter_matrix)[2],
-     sort(log10(colSums(bacteria_quadra__filter_matrix))))
-sort(colSums(bacteria_quadra__filter_matrix))
+  column_to_rownames("OTU") -> bacteria_quadra_filter_matrix
 
-bacteria_quadra__filter_matrix %>%
+dim(bacteria_quadra_matrix)
+
+plot(1:dim(bacteria_quadra_filter_matrix)[2],
+     sort(log10(colSums(bacteria_quadra_filter_matrix))))
+sort(colSums(bacteria_quadra_filter_matrix))
+
+bacteria_quadra_matrix %>%
   rownames_to_column("OTU") %>%
   pivot_longer(-OTU, names_to = "quadra_code", values_to = "reads") %>%
   mutate(reads = floor(reads/10)) %>%
@@ -456,10 +459,87 @@ dim(bacteria_quadra_truncated_matrix)
 
 plot(1:dim(bacteria_quadra_truncated_matrix)[2],
      sort(log10(colSums(bacteria_quadra_truncated_matrix))))
-
+dim(bacteria_quadra_matrix)
+dim(bacteria_quadra_truncated_matrix)
 sort(colSums(bacteria_quadra_matrix))
-sort(colSums(bacteria_quadra__filter_matrix))
 sort(colSums(bacteria_quadra_truncated_matrix))
+plot(1:length(colSums(bacteria_quadra_truncated_matrix)),
+     log10(sort(colSums(bacteria_quadra_truncated_matrix))))
+
+bacteria_quadra_truncated_matrix %>%
+  rownames_to_column("OTU") %>%
+  pivot_longer(-OTU, names_to = "quadra_code", values_to = "reads") %>%
+  group_by(quadra_code) %>%
+  filter(sum(reads)> 4) %>%
+  ungroup() %>%
+  pivot_wider(names_from = "quadra_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU") -> bacteria_quadra_truncated_matrix
+sort(colSums(bacteria_quadra_truncated_matrix))
+
+## Compute sample coverage ----
+iNext_object_bact_quadra <- bacteria_quadra_truncated_matrix %>%
+  iNEXT.3D::iNEXT3D( q = c(0), datatype = "abundance", nboot = 0)
+
+iNext_object_bact_quadra$TDiNextEst$coverage_based %>% 
+  filter(Order.q == 0 & Method == "Observed") %>%
+  arrange(SC) %>%
+  filter(SC < 0.8) -> low_coverage_bact_df
+
+bacteria_quadra_truncated_matrix %>%
+  rownames_to_column("OTU") %>%
+  pivot_longer(-OTU, names_to = "quadra_code", values_to = "reads") %>%
+  filter(!(quadra_code %in% low_coverage_bact_df$Assemblage),
+         reads > 0) %>%
+  pivot_wider(names_from = "quadra_code", values_from = "reads", values_fill = 0) %>%
+  column_to_rownames("OTU") -> bacteria_quadra_filter_matrix
+dim(bacteria_quadra_truncated_matrix)
+dim(bacteria_quadra_filter_matrix)
+sort(colSums(bacteria_quadra_filter_matrix))
+
+
+iNext_object_bact_quadra$TDiNextEst$coverage_based %>% 
+  filter(Order.q == 0 & Method == "Observed" & SC > 0.8) %>%
+  arrange(SC) %>%
+  filter(SC == min(SC, na.rm = TRUE)) %>%
+  pull(SC) -> min_coverage_bact_coverage
+
+bacteria_quadra_filter_matrix %>%
+  iNEXT.3D::estimate3D(level = min_coverage_bact_coverage, q = 0, nboot = 0) %>%
+  select(Assemblage,m) -> required_sizes_bact_quadra
+
+n_sim = 100
+set.seed(2365)
+1:n_sim %>%
+  map(\(x) bacteria_quadra_filter_matrix %>%
+        coverage_rarefy_matrix(required_sizes = required_sizes_bact_quadra)) -> coverage_quadra_bact_list
+coverage_quadra_bact_list %>%
+  map(\(mat) {
+    # convert to tibble with OTU and sample as identifiers
+    mat %>%
+      as.data.frame() %>%
+      rownames_to_column("OTU") %>%
+      pivot_longer(-OTU, names_to = "sample", values_to = "count") 
+  }) %>% 
+  reduce(full_join, by = c("OTU", "sample")) %>%   # union of all OTUs x samples
+  # sum across all count columns (one per simulation)
+  mutate(total = round(rowSums(across(starts_with("count")), na.rm = TRUE)/n_sim)) %>%
+  filter(total>0) %>%
+  select(OTU, sample, total) %>%
+  pivot_wider(names_from = "sample", values_from = "total",values_fill = 0) %>%
+  column_to_rownames("OTU") %>%
+  as.matrix() -> quadra_bact_rarefy
+dim(quadra_bact_rarefy)
+sort(rowSums(quadra_bact_rarefy))
+plotMyMatrix(log1p(quadra_bact_rarefy))
+
+
+sbm_Bact_quadra_gaussian <- estimateBipartiteSBM(log1p(t(quadra_bact_rarefy)),
+                                          model = "gaussian",
+                                          dimLabels = c("grid", "bact"))
+save(sbm_Bact_quadra_gaussian, file = "outputs/heavy_computation_save/sbm_Bact_quadra_gaussian.Rdata")
+load(file = "outputs/heavy_computation_save/sbm_Bact_quadra_gaussian.Rdata")
+
+plot_bipartite_sbm(sbm_Bact_quadra_gaussian)
 
 
 ## Fungi ----
@@ -486,25 +566,6 @@ fungi_quadra_matrix %>%
 dim(fungi_quadra_matrix)
 dim(fungi_quadra_truncated_matrix)
 
-
-
-## Compute sample coverage ----
-
-iNext_object_bact_quadra <- bacteria_quadra_truncated_matrix %>%
-  iNEXT.3D::iNEXT3D( q = c(0), datatype = "abundance", nboot = 0)
-
-iNext_object_bact_quadra$TDiNextEst$coverage_based %>% 
-  filter(Order.q == 0 & Method == "Observed") %>%
-  arrange(SC) 
-iNext_object_bact_quadra$TDiNextEst$coverage_based %>% 
-  filter(Order.q == 0 & Method == "Observed") %>%
-  arrange(SC) %>%
-  filter(SC == min(SC, na.rm = TRUE)) %>%
-  pull(SC) -> min_coverage_bact_coverage
-
-bacteria_quadra_truncated_matrix %>%
-  iNEXT.3D::estimate3D(level = min_coverage_bact_coverage, q = 0, nboot = 0) %>%
-  select(Assemblage,m) -> required_sizes_bact_quadra
 
 ### Fungi ----
 iNext_object_OTU_fungi <- fungi_grid_truncated_matrix %>%

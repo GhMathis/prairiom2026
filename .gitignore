@@ -27,6 +27,7 @@
 *.svg
 *.odt
 *.table
+*.png
 
 # History files
 .Rhistory

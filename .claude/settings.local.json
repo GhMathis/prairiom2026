@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(timeout 600 \"/c/Program Files/R/R-4.5.3/bin/Rscript.exe\" -e 'knitr::knit\\(\"scripts/lawsdiv_bact_fungi_analysis.Rmd\", output=\"scripts/lawsdiv_bact_fungi_analysis.md\"\\)')",
+      "Bash(tee /tmp/rmd_knit.log)",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(timeout 600 '/c/Program Files/R/R-4.5.3/bin/Rscript.exe' -e 'setwd\\(\"D:/Mes Donnees/these/Analyses_data/prairiom2026\"\\); knitr::opts_knit$set\\(root.dir = getwd\\(\\)\\); knitr::knit\\(\"scripts/lawsdiv_bact_fungi_analysis.Rmd\", output=\"scripts/lawsdiv_bact_fungi_analysis.md\"\\)')"
+    ]
+  }
+}

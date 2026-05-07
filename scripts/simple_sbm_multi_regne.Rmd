@@ -369,7 +369,7 @@ wrap_plots(list(gg_bact, gg_fungi, gg_virus, gg_plant), nrow = 1)
 The expected matrix (model reconstruction) smooths noise and makes the block
 structure explicit.
 
-```{r plot-expected, fig.width=14, fig.height=5}
+```{r plot-expected, fig.width=28, fig.height=10}
 gg_bact_exp  <- plot_bipartite_sbm(sbm_Bact_gaussian, mat = sbm_Bact_gaussian$expectation)
 gg_fungi_exp <- plot_bipartite_sbm(sbm_Fungi_gaussian, mat = sbm_Fungi_gaussian$expectation)
 gg_virus_exp <- plot_bipartite_sbm(sbm_Virus,          mat = sbm_Virus$expectation)
@@ -422,7 +422,15 @@ alluvial(
 )
 ```
 
+
+## PLN
+
+```{r}
+
+```
+
 ---
+
 
 # SBM at quadrat level (exploratory)
 
