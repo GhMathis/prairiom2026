@@ -29,6 +29,7 @@
 *.table
 *.png
 
+scripts/lawsdiv/*
 # History files
 .Rhistory
 .Rapp.history
