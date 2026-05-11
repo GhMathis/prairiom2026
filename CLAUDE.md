@@ -43,7 +43,7 @@ These are non-CRAN or Bioconductor and worth knowing about before running anythi
 -   Bioconductor: `phyloseq`, `microbiome`, `ComplexHeatmap` (install via `BiocManager::install(...)`).
 -   R-universe: `microViz` (`repos = c(davidbarnett = "https://david-barnett.r-universe.dev", getOption("repos"))`).
 -   GitHub: `microDecon` (`remotes::install_github("donaldtmcknight/microDecon")`).
--   CRAN, but central to the analyses: `sbm`, `iNEXT`, `iNEXT.3D`, `siland`, `vegan`, `FactoMineR`, `factoextra`, `sf`, `terra`, `tidyverse`.
+-   CRAN, but central to the analyses: `sbm`, `iNEXT`, `iNEXT.3D`, `siland`, `vegan`, `FactoMineR`, `factoextra`, `sf`, `terra`, `tidyverse`, `PLNmodels` (Poisson-lognormal JSDM, used in `simple_sbm_multi_regne.Rmd` for bloc-level co-structure).
 
 There is no `renv.lock` / `DESCRIPTION` — package state is not pinned. If you add a dependency, mention it in commit messages so it can be reproduced.
 

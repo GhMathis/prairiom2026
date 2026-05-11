@@ -29,6 +29,8 @@ library(sbm)
 library(iNEXT.3D)
 library(patchwork)
 library(alluvial)
+library(PLNmodels)
+
 
 source("scripts/plot_multipartite_sbm.R")
 source("scripts/functions_modified.R")
@@ -383,9 +385,11 @@ wrap_plots(list(gg_bact_exp, gg_fungi_exp, gg_virus_exp, gg_plant_exp), nrow = 1
 ```{r plot-avg-blocks, fig.width=10, fig.height=4}
 sbm_Bact_avg  <- plot_bipartite_sbm_avg(sbm_Bact_gaussian)
 sbm_Fungi_avg <- plot_bipartite_sbm_avg(sbm_Fungi_gaussian)
+sbm_Virus_avg <- plot_bipartite_sbm_avg(sbm_Virus)
 
 sbm_Bact_avg$plot
 sbm_Fungi_avg$plot
+sbm_Virus_avg$plot
 ```
 
 ## Cross-kingdom block co-membership (alluvial)
@@ -423,11 +427,491 @@ alluvial(
 ```
 
 
-## PLN
+## PLN — bloc-level JSDM (bacteria × fungi)
 
-```{r}
+We use the SBM averaged expectations (`sbm_*_avg$matrix`, on the
+`log1p(rarefied_count)` scale) as the per-bloc signal per grid. PLN is fit on
+counts so we back-transform with `expm1()` and round to integers; this restores
+expected per-bloc rarefied counts, which PLN's Poisson-lognormal handles cleanly
+with `offset = "TSS"`.
 
+Goal: partition joint bact × fungi variation into (a) environmental filtering
+(β), (b) residual co-organization (Ω) after controlling for env, (c) noise.
+PLN gives β + Ω directly; PLNnetwork gives sparse partial correlations; a
+200-permutation null on rows of X tests inter-kingdom Ω entries.
+
+### Build response Y
+
+```{r pln-build-Y}
+Y_bact  <- round(expm1(sbm_Bact_avg$matrix),  0)%>%
+            as.data.frame()
+Y_fungi <- round(expm1(sbm_Fungi_avg$matrix), 0)%>%
+            as.data.frame()
+Y_virus <- round(sbm_Virus_avg$matrix, 0)%>%
+            as.data.frame()
+
+Y_bact %>%
+  rownames_to_column("grid") %>%
+  left_join(Y_fungi %>%
+            rownames_to_column("grid"),by = "grid") %>%
+  left_join(Y_virus %>%
+            rownames_to_column("grid"),by = "grid") %>%
+  column_to_rownames("grid") %>%
+  as.matrix() -> Y
+
+storage.mode(Y) <- "integer"
+
+kingdom <- c(rep("bact",  ncol(Y_bact)),
+             rep("fungi", ncol(Y_fungi)),
+             rep("virus", ncol(Y_virus)))
+names(kingdom) <- colnames(Y)
+
+cat("Y:", nrow(Y), "grids x", ncol(Y), "blocs",
+    "(bact:", ncol(Y_bact), ", fungi:", ncol(Y_fungi), "virus:", ncol(Y_virus), ")\n")
+cat("Min and max of Y:", range(Y), "\n")
 ```
+
+### Build design matrix X
+
+```{r pln-build-X}
+meta <- read.table("data/bacteria/Metadata_grid_CAM.txt",
+                   header = TRUE, stringsAsFactors = FALSE,
+                   na.strings = c("NA", "", "."))
+
+meta <- meta %>%
+  filter(!str_detect(Grid_code, "21_CAM_1[45]")) 
+rownames(Y)[!(rownames(Y) %in% meta$Grid_code)]
+
+Y = Y[!(rownames(Y) == "22_CAM_15"),]
+# Align meta rows to Y rows
+stopifnot(all())
+meta <- meta[match(rownames(Y), meta$Grid_code), , drop = FALSE]
+stopifnot(identical(meta$Grid_code, rownames(Y)))
+
+colnames(meta)
+X <- meta %>%
+  select(clust_landscp, clust_land_use, sbm_soil, clust_smb_grid_plant, 
+         plant_richness, Biomass,plant_equit)
+rownames(X) <- meta$Grid_code
+
+cat("X:", nrow(X), "grids x", ncol(X), "covariates\n")
+cat("n / p ratio:", round(nrow(X) / ncol(X), 1), "\n")
+```
+
+## Step 1 — Fit all models
+
+We compare the 2³ design:
+
+- **Model**: `full` (all covariates in `X`) vs `null` (intercept only)
+- **Offset**: `off` (TSS library-size offset) vs `noff` (no offset)
+- **Sparsity**: `pln` (dense PLN) vs `net` (PLNnetwork, BIC-selected best)
+
+Total: 8 fits. All stored in named lists for easy access:
+`fits_pln$<full|null>_<off|noff>`, `nets$<full|null>_<off|noff>`,
+`bests$<full|null>_<off|noff>` (BIC-best PLNnetwork). `all_fits` is the
+combined list keyed by `pln_*` / `net_*`.
+
+To change the env covariates: edit the `pln-build-X` chunk above. The fitting
+uses `~ .` so anything in `X` is picked up.
+
+```{r pln-fit-all}
+
+formulas <- list(
+  full_off  = Abundance ~ . + offset(log(Offset)),
+  full_noff = Abundance ~ .,
+  null_off  = Abundance ~ 1 + offset(log(Offset)),
+  null_noff = Abundance ~ 1
+)
+
+d        <- prepare_data(counts = Y, covariates = X, offset = "TSS")
+fits_pln <- purrr::map(formulas, function(f) do.call(PLN,        list(formula = f, data = d)))
+nets     <- purrr::map(formulas, function(f) do.call(PLNnetwork, list(formula = f, data = d)))
+
+
+# BIC-best PLNnetwork models
+bests <- purrr::map(nets, ~ getBestModel(.x, "BIC"))
+
+# Combined list (8 entries) for downstream extraction
+all_fits <- c(
+  setNames(fits_pln, paste0("pln_", names(fits_pln))),
+  setNames(bests,    paste0("net_", names(bests)))
+)
+names(all_fits)
+```
+
+## Step 2 — Per-model summary table
+
+```{r pln-summary-table}
+diag_df <- tibble::tibble(
+  model_id = names(all_fits),
+  loglik   = purrr::map_dbl(all_fits, "loglik"),
+  BIC      = purrr::map_dbl(all_fits, "BIC")
+)
+knitr::kable(diag_df, digits = 1,
+             caption = "Per-model log-likelihood and BIC (8 fits)")
+```
+
+## Step 3 — β extraction
+
+Null models have no β (intercept only) and are skipped.
+
+```{r pln-beta-extract}
+extract_beta <- function(fit, label) {
+  B <- coef(fit)
+  if (is.null(B) || nrow(B) <= 1) return(tibble::tibble())   # null model
+  B %>%
+    as.data.frame() %>%
+    rownames_to_column("covariate") %>%
+   
+    pivot_longer(-covariate, names_to = "bloc", values_to = "beta") %>%
+    mutate(model_id = label)
+}
+
+beta_long <- purrr::imap_dfr(all_fits, extract_beta) %>%
+  mutate(kingdom = kingdom[bloc],
+         bloc    = factor(bloc, levels = colnames(Y)))
+```
+
+### β heatmap — env effects per bloc
+
+```{r pln-beta-heatmap, fig.width=14, fig.height=8}
+ggplot(beta_long, aes(x = bloc, y = covariate, fill = beta)) +
+  geom_tile(colour = "white") +
+  facet_grid(model_id ~ kingdom, scales = "free_x", space = "free_x") +
+  scale_fill_gradient2(low = "#2c7bb6", mid = "white", high = "#d7191c",
+                       name = expression(beta)) +
+  labs(x = NULL, y = NULL,
+       title = "β across full models (pln vs net × offset vs no-offset)") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### β forest plot — distribution of effects per covariate
+
+```{r pln-beta-forest, fig.width=12, fig.height=6}
+ggplot(beta_long, aes(x = beta, y = covariate, colour = kingdom)) +
+  geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
+  geom_jitter(height = 0.15, alpha = 0.8, size = 1.5) +
+  scale_colour_manual(values = c(bact = "#1b9e77", fungi = "#d95f02")) +
+  facet_wrap(~ model_id, ncol = 2) +
+  labs(x = expression(beta), y = NULL) +
+  theme_bw(base_size = 10)
+```
+
+## Step 4 — Variance partitioning
+
+Per (sparsity × offset): residual var = `diag(sigma(fit_full))`, total var =
+`diag(sigma(fit_null))`, env share = `(total − residual) / total`. Four model
+pairs.
+
+```{r pln-vp-extract}
+vp_pair <- function(fit_full, fit_null, label) {
+  v_total <- diag(sigma(fit_null))
+  v_resid <- diag(sigma(fit_full))
+  v_env   <- pmax(v_total - v_resid, 0)
+  tibble::tibble(
+    bloc       = colnames(Y),
+    kingdom    = kingdom,
+    v_total    = v_total,
+    v_env      = v_env,
+    v_residual = v_resid,
+    prop_env   = v_env / pmax(v_total, .Machine$double.eps),
+    model_id   = label
+  )
+}
+
+vp_long <- bind_rows(
+  vp_pair(fits_pln$full_off,  fits_pln$null_off,  "pln_off"),
+  vp_pair(fits_pln$full_noff, fits_pln$null_noff, "pln_noff"),
+  vp_pair(bests$full_off,     bests$null_off,     "net_off"),
+  vp_pair(bests$full_noff,    bests$null_noff,    "net_noff")
+)
+
+vp_summary <- vp_long %>%
+  group_by(model_id, kingdom) %>%
+  summarise(prop_env_mean = mean(prop_env),
+            prop_env_sd   = sd(prop_env),
+            n_blocs       = dplyr::n(),
+            .groups = "drop")
+
+knitr::kable(vp_summary, digits = 3,
+             caption = "Variance partitioning summary (full vs null pairs)")
+```
+
+### Variance partitioning — stacked bar per bloc
+
+```{r pln-vp-bar, fig.width=14, fig.height=8}
+vp_long %>%
+  pivot_longer(c(v_env, v_residual),
+               names_to = "source", values_to = "var") %>%
+  mutate(source = recode(source,
+                         v_env      = "Environment",
+                         v_residual = "Residual")) %>%
+  ggplot(aes(x = bloc, y = var, fill = source)) +
+  geom_col(position = "fill") +
+  facet_grid(model_id ~ kingdom, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = c("Environment" = "#fdae61",
+                               "Residual"    = "#80b1d3")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(y = "Variance share", x = NULL, fill = NULL,
+       title = "Variance partitioning per bloc, across models") +
+  theme_bw(base_size = 10) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Variance partitioning — per-kingdom boxplot
+
+```{r pln-vp-boxplot, fig.width=12, fig.height=5}
+ggplot(vp_long, aes(x = kingdom, y = prop_env, fill = kingdom)) +
+  geom_boxplot(width = 0.4, outlier.shape = NA) +
+  geom_jitter(width = 0.1, height = 0, alpha = 0.7) +
+  facet_wrap(~ model_id, nrow = 1) +
+  scale_fill_manual(values = c(bact = "#1b9e77", fungi = "#d95f02")) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(y = "Proportion of variance explained by env", x = NULL,
+       title = "Environmental filtering, per kingdom, across models") +
+  theme_bw(base_size = 10) +
+  theme(legend.position = "none")
+```
+
+## Step 5 — Ω / partial-correlation heatmaps
+
+Ω is the precision matrix (Σ⁻¹); partial correlations are `-Ω_{ij}/sqrt(Ω_{ii}·Ω_{jj})`.
+For dense PLN fits Ω is obtained by inverting Σ; for PLNnetwork (BIC) best models
+the sparse Ω is taken directly from the fitted model parameters.
+
+```{r pln-omega-extract}
+get_partial_cor <- function(fit) {
+  Omega <- if (!is.null(fit$model_par$Omega)) fit$model_par$Omega else solve(sigma(fit))
+  D     <- 1 / sqrt(diag(Omega))
+  P     <- -sweep(sweep(Omega, 1, D, "*"), 2, D, "*")
+  diag(P) <- 1
+  P
+}
+
+omega_long <- purrr::imap_dfr(all_fits, function(fit, id) {
+  M <- get_partial_cor(fit)
+  dimnames(M) <- list(colnames(Y), colnames(Y))
+  as.data.frame(M) %>%
+    rownames_to_column("row") %>%
+    pivot_longer(-row, names_to = "col", values_to = "value") %>%
+    mutate(model_id = id)
+})
+```
+
+### Ω heatmap grid (8 panels)
+
+```{r pln-omega-heatmap, fig.width=16, fig.height=9, out.width="100%"}
+n_blocs   <- length(bloc_order)
+mid_bact  <- split_at / 2
+mid_fungi <- split_at + (n_blocs - split_at) / 2
+
+id_labels <- c(
+  pln_full_off  = "PLN · Full + offset",
+  pln_full_noff = "PLN · Full",
+  pln_null_off  = "PLN · Intercept + offset",
+  pln_null_noff = "PLN · Intercept only",
+  net_full_off  = "PLNnet · Full + offset",
+  net_full_noff = "PLNnet · Full",
+  net_null_off  = "PLNnet · Intercept + offset",
+  net_null_noff = "PLNnet · Intercept only"
+)
+
+omega_long %>%
+  mutate(
+    row      = factor(row, levels = bloc_order),
+    col      = factor(col, levels = bloc_order),
+    model_id = factor(model_id, levels = names(id_labels))
+  ) %>%
+  ggplot(aes(x = col, y = row, fill = value)) +
+  geom_tile(colour = NA) +
+  geom_hline(yintercept = split_at, colour = "grey10", linewidth = 1.2) +
+  geom_vline(xintercept = split_at, colour = "grey10", linewidth = 1.2) +
+  facet_wrap(~ model_id, nrow = 2, labeller = labeller(model_id = id_labels)) +
+  scale_fill_gradient2(
+    low    = "#2166ac",
+    mid    = "white",
+    high   = "#b2182b",
+    limits = c(-1, 1),
+    oob    = scales::squish,
+    name   = "Partial\ncorrelation",
+    breaks = c(-1, -0.5, 0, 0.5, 1)
+  ) +
+  scale_x_discrete(
+    breaks = c(bloc_order[round(mid_bact)], bloc_order[round(mid_fungi)]),
+    labels = c("Bacteria", "Fungi")
+  ) +
+  scale_y_discrete(
+    breaks = c(bloc_order[round(mid_bact)], bloc_order[round(mid_fungi)]),
+    labels = c("Bacteria", "Fungi")
+  ) +
+  coord_fixed(expand = FALSE) +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x       = element_text(size = 9, colour = "grey30"),
+    axis.text.y       = element_text(size = 9, colour = "grey30", angle = 90, hjust = 0.5),
+    axis.ticks        = element_blank(),
+    strip.text        = element_text(size = 9, face = "bold"),
+    strip.background  = element_rect(fill = "#eef2f7", colour = "grey60", linewidth = 0.5),
+    legend.position   = "right",
+    legend.key.height = unit(3, "cm"),
+    legend.key.width  = unit(0.5, "cm"),
+    legend.title      = element_text(size = 9, face = "bold"),
+    panel.border      = element_rect(colour = "grey60", linewidth = 0.5),
+    panel.spacing     = unit(0.6, "lines"),
+    plot.margin       = margin(5, 5, 5, 5)
+  )
+```
+
+## Step 6 — PLNnetwork regularisation paths
+
+```{r pln-network-path, fig.width=14, fig.height=4}
+plots_path <- purrr::imap(nets, function(net, id) {
+  plot(net, criteria = c("BIC", "ICL", "EBIC")) +
+    labs(title = id)
+})
+patchwork::wrap_plots(plots_path, ncol = 4)
+```
+
+## Step 7 — Network plots (best PLNnetwork by BIC)
+
+```{r pln-network-plot, fig.width=14, fig.height=4}
+par(mfrow = c(1, 4))
+purrr::iwalk(bests, function(best, id) plot(best, main = id))
+par(mfrow = c(1, 1))
+```
+
+## Step 8 — Goodness of fit
+
+Observed vs fitted on log1p scale, faceted by model. Null and no-offset
+models will visibly deviate from the 1:1 line — that is the diagnostic.
+
+```{r pln-goodness, fig.width=14, fig.height=8}
+gof_long <- purrr::imap_dfr(all_fits, function(fit, id) {
+  tibble::tibble(
+    fitted   = as.vector(fitted(fit)),
+    obs      = as.vector(Y),
+    kingdom  = rep(kingdom, each = nrow(Y)),
+    model_id = id
+  )
+})
+
+ggplot(gof_long, aes(x = log1p(obs), y = log1p(fitted), colour = kingdom)) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey50") +
+  geom_point(alpha = 0.4) +
+  facet_wrap(~ model_id, ncol = 4) +
+  scale_colour_manual(values = c(bact = "#1b9e77", fungi = "#d95f02")) +
+  labs(x = "log1p(observed)", y = "log1p(fitted)",
+       title = "Goodness of fit across models") +
+  theme_bw(base_size = 10)
+```
+
+<!-- ### Permutation null for inter-kingdom Ω entries -->
+
+<!-- Permuting **rows of X** breaks any env-driven covariance between kingdoms while -->
+<!-- preserving marginals and intra-kingdom signal. With n ≈ 42 and 200 refits this -->
+<!-- takes a few minutes — cache the result. -->
+
+<!-- ```{r pln-permutation} -->
+<!-- inter_idx <- which(outer(kingdom, kingdom, "!="), arr.ind = TRUE) -->
+<!-- inter_idx <- inter_idx[inter_idx[, 1] < inter_idx[, 2], , drop = FALSE] -->
+
+
+<!-- set.seed(20260507) -->
+<!-- n_perm    <- 1000 -->
+<!-- perm_dist <- matrix(NA_real_, nrow = nrow(inter_idx), ncol = n_perm) -->
+
+<!-- for (k in seq_len(n_perm)) { -->
+<!--   perm_dist[, k] <- tryCatch({ -->
+<!--     X_perm <- X[sample(nrow(X)), , drop = FALSE] -->
+<!--     rownames(X_perm) <- rownames(X) -->
+<!--     d_p    <- prepare_data(counts = Y, covariates = X_perm, offset = "TSS") -->
+<!--     fit_p  <- PLN(Abundance ~ clust_landscp + clust_land_use + clust_land_use + -->
+<!--                   clust_smb_grid_plant + plant_H + Biomass + virus_richness, data = d_p, -->
+<!--                   control = PLN_param(trace = 0)) -->
+<!--     sigma(fit_p)[inter_idx] -->
+<!--   }, error = function(e) rep(NA_real_, nrow(inter_idx))) -->
+<!-- } -->
+
+<!-- obs_inter <- Omega[inter_idx] -->
+<!-- p_inter   <- rowMeans(abs(perm_dist) >= abs(obs_inter), na.rm = TRUE) -->
+
+<!-- str(perm_dist) -->
+<!-- n_eff <- sum(!is.na(perm_dist[1, ])) -->
+<!-- cat("Effective N permutations:", n_eff, "/", ncol(perm_dist), "\n") -->
+<!-- cat("Inter-kingdom |Omega| entries with p < 0.05:", -->
+<!--     sum(p_inter < 0.05, na.rm = TRUE), "/", length(p_inter), "\n") -->
+<!-- ``` -->
+
+<!-- ### Permutation null — top inter-kingdom Ω entries -->
+
+<!-- ```{r pln-perm-histograms, fig.width=10, fig.height=7} -->
+<!-- top_k_idx <- order(abs(Omega[inter_idx]), decreasing = TRUE)[ -->
+<!--   seq_len(min(9, nrow(inter_idx))) -->
+<!-- ] -->
+
+<!-- pair_labels <- apply(inter_idx[top_k_idx, , drop = FALSE], 1, function(rc) { -->
+<!--   sprintf("%s x %s", colnames(Y)[rc[1]], colnames(Y)[rc[2]]) -->
+<!-- }) -->
+
+<!-- perm_df <- purrr::map_dfr(seq_along(top_k_idx), function(j) { -->
+<!--   k <- top_k_idx[j] -->
+<!--   tibble( -->
+<!--     label = pair_labels[j], -->
+<!--     pval  = p_inter[k], -->
+<!--     obs   = Omega[inter_idx][k], -->
+<!--     perm  = perm_dist[k, ] -->
+<!--   ) -->
+<!-- }) %>% -->
+<!--   mutate(facet_label = sprintf("%s\n(p = %.2f)", label, pval)) -->
+
+<!-- ggplot(perm_df, aes(x = perm)) + -->
+<!--   geom_histogram(bins = 30, fill = "grey80", colour = "grey40") + -->
+<!--   geom_vline(aes(xintercept = obs), colour = "#d7191c", linewidth = 1) + -->
+<!--   facet_wrap(~ facet_label, scales = "free") + -->
+<!--   labs(x = "Omega (permuted)", y = "Count", -->
+<!--        title = "Permutation null — top |Omega| inter-kingdom entries", -->
+<!--        subtitle = "Red line = observed value") + -->
+<!--   theme_bw(base_size = 10) -->
+<!-- ``` -->
+
+<!-- ### Ω heatmap with kingdom blocks and significance -->
+
+<!-- Asterisks mark inter-kingdom entries with permutation p-value < 0.05. -->
+
+<!-- ```{r pln-omega-heatmap, fig.width=10, fig.height=10} -->
+<!-- sig_mat <- matrix("", nrow = nrow(Omega), ncol = ncol(Omega)) -->
+<!-- for (k in seq_len(nrow(inter_idx))) { -->
+<!--   i <- inter_idx[k, 1]; j <- inter_idx[k, 2] -->
+<!--   if (!is.na(p_inter[k]) && p_inter[k] < 0.05) { -->
+<!--     sig_mat[i, j] <- "*" -->
+<!--     sig_mat[j, i] <- "*" -->
+<!--   } -->
+<!-- } -->
+<!-- #BiocManager::install("ComplexHeatmap") -->
+
+<!-- ComplexHeatmap::Heatmap( -->
+<!--   Omega, -->
+<!--   name            = "Omega", -->
+<!--   cluster_rows    = FALSE, -->
+<!--   cluster_columns = FALSE, -->
+<!--   row_split       = factor(kingdom), -->
+<!--   column_split    = factor(kingdom), -->
+<!--   cell_fun = function(j, i, x, y, width, height, fill) { -->
+<!--     grid::grid.text(sig_mat[i, j], x, y, gp = grid::gpar(fontsize = 9)) -->
+<!--   } -->
+<!-- ) -->
+
+<!-- ComplexHeatmap::Heatmap( -->
+<!--   Omega_sparse, -->
+<!--   name            = "Omega", -->
+<!--   cluster_rows    = FALSE, -->
+<!--   cluster_columns = FALSE, -->
+<!--   row_split       = factor(kingdom), -->
+<!--   column_split    = factor(kingdom), -->
+<!-- ) -->
+<!-- ``` -->
 
 ---
 
