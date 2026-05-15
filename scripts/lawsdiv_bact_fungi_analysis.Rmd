@@ -27,14 +27,6 @@ library(RColorBrewer)
 
 # Define theme and core estimators inline
 
-We use the project's `main_theme` (matched to other plotting scripts in
-`scripts/`) instead of sourcing lawsdiv's `ggplot_mytheme.R` — the latter
-hard-codes `family = "Helvetica"`, which is not in the Windows font database
-and produces hundreds of warnings per knit. The parameter-estimation
-helpers (`fun_erf`, `estimatemean_f`, `simple_par`) are copied verbatim from
-`scripts/lawsdiv/Code/EstimatePars.R`. `fancy_scientific` is the lawsdiv
-helper used by the AFD-plot y-axis labeller.
-
 ```{r lawsdiv-helpers}
 ## --- project plotting theme (matches scripts/3_plant_community_structure.R) ---
 main_theme <- theme_minimal() +
@@ -198,13 +190,25 @@ datatax <- datatax %>%
 proj <- datatax %>%
   filter(nreads > nreads_cutoff, count > count_cutoff) %>%
   group_by(project_id, classification, otu_id) %>%
-  mutate(tf   = mean(count / nreads),
-         o    = n(),
-         tvpf = mean((count^2 - count) / nreads^2)) %>%
+  mutate(
+    ## tf: mean relative abundance (count/nreads) over grids where the OTU IS present
+    tf   = mean(count / nreads),
+    ## o: raw count of grids where this OTU is present (fraction computed below)
+    o    = n(),
+    ## tvpf: shot-noise-corrected mean of p² over present grids.
+    ##   Using (count²-count) instead of count² removes Poisson sampling noise:
+    ##   E[k(k-1)/N²] ≈ p²  whereas  E[k²/N²] = p² + p/N (biased upward)
+    tvpf = mean((count^2 - count) / nreads^2)
+  ) %>%
   ungroup() %>%
   group_by(project_id, classification) %>%
+  ## Convert o from raw count to fraction: n_present_grids / n_total_grids
   mutate(o = o / n_distinct(run_id)) %>%
+  ## f  = E[p over ALL grids] = P(present) × E[p | present]  (absent grids contribute 0)
+  ## vf = E[p² over ALL grids], same trick: multiply within-present mean by occupancy
   mutate(f = o * tf, vf = o * tvpf) %>%
+  ## Complete the Var[p] = E[p²] - E[p]² identity → vf is now the population variance
+  ## of relative abundance across ALL grids (zeros included, shot noise removed)
   mutate(vf = vf - f^2) %>%
   ungroup() %>%
   mutate(idall = paste(project_id, classification),
@@ -225,10 +229,16 @@ shape `beta = 1 / cv^2` (with `cv^2 = vf / f^2`) and scale `theta = f / beta`.
 ```{r gamma-pars}
 gamma_pars <- proj %>%
   select(idall, sname, otu_id, o, f, vf) %>%
+  ## cv = coefficient of variation of relative abundance across grids = sd/mean
   mutate(cv = sqrt(vf / f^2)) %>%
   distinct() %>%
+  ## beta  = shape of the Gamma AFD = 1/cv²
+  ##         high beta → OTU is stable across grids (low relative variability)
+  ##         low beta  → OTU fluctuates strongly between grids
+  ## theta = scale of the Gamma AFD = f/beta  (so that mean = beta*theta = f)
   mutate(beta = 1 / cv^2, theta = f / beta)
 
+hist(log(gamma_pars$beta), breaks = 30)
 cat("gamma_pars dimensions: ", dim(gamma_pars), "\n")
 head(gamma_pars)
 
@@ -246,17 +256,20 @@ Taylor's law states `Var(f) ~ <f>^2`. We plot it per kingdom (with the slope-2
 reference line) and overlay binned means in the style of `Fig1.R`.
 
 ```{r taylor-plot, fig.width = 10, fig.height = 5}
-dir.create("outputs/figures", showWarnings = FALSE, recursive = TRUE)
-
 nbins <- 15
+## Build binned means to overlay on the Taylor plot (same binning trick as the AFD histogram)
+## Goal: show the average trend through the cloud of per-OTU points
 taylor_binnes <- gamma_pars %>%
   filter(f > 0, vf > 0) %>%
   group_by(idall, sname) %>%
+  ## dlf = bin width in log(f) space; b = bin index for each OTU
   mutate(lf = log(f), dlf = (max(lf) - min(lf)) / nbins) %>%
   mutate(b = as.integer((lf - min(lf)) / dlf)) %>%
   ungroup() %>%
+  ## Average f and vf within each bin → one representative point per bin per kingdom
   group_by(idall, sname, b) %>%
   summarise(vf = mean(vf), f = mean(f), .groups = "drop") %>%
+  ## xx = random jitter used only to shuffle draw order (avoids one kingdom always on top)
   mutate(xx = runif(n())) %>%
   arrange(xx)
 
@@ -304,21 +317,38 @@ cutoffs
 estimate_mean <- gamma_pars %>%
   filter(f > 0) %>%
   mutate(lf = log(f)) %>%
+  ## Attach the per-kingdom cutoff c and keep only OTUs above it
+  ## (rare OTUs below c have noisy mean estimates and would bias the fit)
   left_join(cutoffs, by = "sname") %>%
   ungroup() %>%
   filter(lf > c) %>%
   group_by(idall, sname) %>%
-  summarise(c     = mean(c),
-            m1    = mean(lf),
-            m2    = mean(lf^2),
-            ns_obs = n_distinct(otu_id),
-            nf    = sum(f),
-            .groups = "drop") %>%
+  summarise(
+    c      = unique(c),
+    ## m1 = first moment of log(f) above cutoff  = mean of log(f)
+    m1     = mean(lf),
+    ## m2 = second moment of log(f) above cutoff = mean of log(f)²
+    ##      together m1 and m2 constrain the lognormal mu and sigma via fun_erf
+    m2     = mean(lf^2),
+    ## ns_obs = number of OTUs observed above the cutoff
+    ns_obs = n_distinct(otu_id),
+    ## nf = total relative abundance pooled across those OTUs
+    nf     = sum(f),
+    .groups = "drop"
+  ) %>%
   rowwise() %>%
-  mutate(mu    = estimatemean_f(c, m1, m2),
-         sigma = sqrt(-c * m1 + m2 + c * mu - m1 * mu)) %>%
+  mutate(
+    ## mu    = lognormal mean of log(f): root of fun_erf given c, m1, m2
+    ##         this is the peak of the full MAD (including OTUs below cutoff)
+    mu    = estimatemean_f(c, m1, m2),
+    ## sigma = lognormal sd of log(f), derived analytically once mu is known
+    sigma = sqrt(-c * m1 + m2 + c * mu - m1 * mu)
+  ) %>%
   ungroup() %>%
   as.data.frame() %>%
+  ## stot = estimated TOTAL species richness (including OTUs too rare to observe above c)
+  ##        = ns_obs / P(log(f) > c)  where P is the lognormal CDF tail
+  ##        erfc((c-mu)/sigma/√2) / 2 = P(log(f) > c) for a N(mu, sigma²)
   mutate(stot = 2 * ns_obs / erfc((c - mu) / sigma / sqrt(2)))
 
 estimate_mean
@@ -339,16 +369,25 @@ on x and `p / [0.5 * erfc((mu-c)/sqrt(2)/sigma)] * sqrt(2 pi)` on a log y.
 A perfect lognormal collapses on the parabola `y = -x^2` (in log10 units).
 
 ```{r mad-plot, fig.width = 10, fig.height = 5}
+## statp: histogram of log(f) per kingdom, used to plot the empirical MAD
+## cutoff = -100 is a placeholder (kept in summarise to survive the group_by);
+## the real cutoff comes from estimate_mean joined below
 statp <- gamma_pars %>%
   filter(f > 0) %>%
   mutate(lf = log(f), cutoff = -100) %>%
   group_by(idall) %>%
+  ## df = bin width in log(f) space (range / nbin)
   mutate(df = (max(lf) - min(lf)) / nbin) %>%
+  ## b  = bin index: which of the nbin bins this OTU falls in
   mutate(b = as.integer((lf - min(lf)) / df)) %>%
   ungroup() %>%
   group_by(idall, b, df) %>%
+  ## lf collapses to the bin mean; n = number of OTUs in this bin
   summarise(lf = mean(lf), cutoff = mean(cutoff), n = n(), .groups = "drop") %>%
   group_by(idall) %>%
+  ## p = probability density = relative frequency / bin width
+  ##     dividing by df converts probability (sums to 1) to density (integrates to 1)
+  ##     so the histogram can be compared directly to the lognormal curve
   mutate(p = n / sum(n) / df) %>%
   ungroup()
 
@@ -358,16 +397,23 @@ p_mad <- statp %>%
   left_join(estimate_mean, by = "idall") %>%
   arrange(xx, sname) %>%
   ggplot() + main_theme +
+  ## Reference parabola: y = -x² is what a perfect lognormal gives in log10 units
   stat_function(fun = simple_par, color = "black", size = 1) +
   aes(
+    ## x-axis: standardise log(f) to lognormal units → x=0 at the mean mu
     x = (lf - mu) / sqrt(2 * sigma^2),
+    ## y-axis: rescale density so the truncated lognormal integrates to 1 above cutoff;
+    ##   the erfc term accounts for the probability mass below the cutoff c
+    ##   the +0.5*log(2π) converts from natural-log to log10 probability density
     y = 10^(log(p) - log(0.5 * erfc((mu - c) / sqrt(2) / sigma)) +
             0.5 * log(2 * pi)),
     color = as.factor(sname),
     shape = as.factor(sname)
   ) +
   geom_point(size = 3, stroke = 1) +
+  ## Left vertical line: position of the cutoff c in rescaled units
   geom_vline(aes(xintercept = (c - mu) / sqrt(2 * sigma^2))) +
+  ## Right vertical line: x=0, i.e. the estimated lognormal mean mu
   geom_vline(aes(xintercept = 0)) +
   scale_x_continuous("Rescaled log average abundance") +
   scale_y_log10("Fraction of species") +
@@ -389,6 +435,11 @@ reference (`-x^2 - log10(2 pi) / 2 + log10(e)`) is plotted as a dashed line
 for comparison.
 
 ```{r afd-plot, fig.width = 10, fig.height = 5}
+## gammalog: log10 probability density of the standardised Gamma AFD (Grilli 2020 eq.1)
+##   x = rescaled log relative abundance (standardised by sqrt(trigamma(k)))
+##   k = shape parameter; k=1.7 is the paper's cross-environment empirical value
+## lognlog: log10 probability density of a standard normal — the lognormal reference
+##   a perfect lognormal gives a parabola -x² in log10 units (same as the MAD plot)
 gammalog <- function(x, k = 1.7) {
   (k * trigamma(k) * x - exp(sqrt(trigamma(k)) * x + digamma(k))) -
     log(gamma(k)) + k * digamma(k) + log10(exp(1))
@@ -396,48 +447,108 @@ gammalog <- function(x, k = 1.7) {
 lognlog <- function(x) { -x^2 - log10(2 * pi) / 2 + log10(exp(1)) }
 
 nbin_afd <- 20
-dh <- proj %>%
+rla_asv <- proj %>%
+  ## Only OTUs present every grid so that each OTU contributes
+  ## many data points to build its own within-OTU distribution
   filter(o > 0.999, nreads > 0, count > 0) %>%
+  ## l      = log relative abundance for this (OTU, grid) observation
+  ## f_inst = raw relative abundance for this observation (used for k below)
   mutate(l = log(count / nreads), f_inst = count / nreads) %>%
   group_by(otu_id, idall, sname) %>%
+  ## ml = mean of log relative abundance across grids (per OTU)
+  ## sl = sd   of log relative abundance across grids (per OTU)
+  ## k  = empirical Gamma shape from moments: mean²/variance of relative abundance
+  ##      (per-OTU estimate; the curve uses k=1.7 from Grilli, not this value)
   mutate(ml = mean(l), sl = sd(l),
          k  = mean(f_inst)^2 / var(f_inst)) %>%
   ungroup() %>%
   filter(!is.na(sl), sl > 0) %>%
-  mutate(lf = (l - ml) / sl) %>%
+  ## lf = standardised log relative abundance: (l - ml) / sl
+  ##      centres each OTU at 0 and scales to unit variance
+  ##      → all OTUs collapse onto the same x-axis regardless of their mean abundance
+  mutate(lf = (l - ml) / sl)
+
+dh_per_asv <- rla_asv %>%
+  group_by(idall, otu_id, sname) %>%
+  ## Manual histogram over the pooled standardized values:
+  ## df = bin width, b = bin index (same logic as MAD histogram above)
+  mutate(df = (max(lf) - min(lf)) / nbin_afd) %>%
+  mutate(b  = as.integer((lf - min(lf)) / df)) %>%
+  ungroup() %>%
+  group_by(idall, b, df, sname,otu_id) %>%
+  ## lf collapses to bin mean; n = observations per bin; k = mean shape in that bin
+  summarise(lf = mean(lf), n = n(), k = mean(k, na.rm = TRUE),
+            .groups = "drop") %>%
+  group_by(idall) %>%
+  ## p = probability density (same formula as MAD: relative frequency / bin width)
+  mutate(p = n / sum(n) / df) %>%
+  ungroup()
+ 
+dh <- rla_asv %>%
   group_by(idall, sname) %>%
+  ## Manual histogram over the pooled standardized values:
+  ## df = bin width, b = bin index (same logic as MAD histogram above)
   mutate(df = (max(lf) - min(lf)) / nbin_afd) %>%
   mutate(b  = as.integer((lf - min(lf)) / df)) %>%
   ungroup() %>%
   group_by(idall, b, df, sname) %>%
+  ## lf collapses to bin mean; n = observations per bin; k = mean shape in that bin
   summarise(lf = mean(lf), n = n(), k = mean(k, na.rm = TRUE),
             .groups = "drop") %>%
   group_by(idall) %>%
+  ## p = probability density (same formula as MAD: relative frequency / bin width)
   mutate(p = n / sum(n) / df) %>%
   ungroup()
 
 cat("dh dimensions (binned standardised AFD points): ", dim(dh), "\n")
+```
 
-p_afd <- dh %>%
+
+```{r afd-plot, fig.width = 10, fig.height = 5}
+dh %>%
   arrange(sname) %>%
-  ggplot() + main_theme +
-  stat_function(fun = lognlog, color = "black", size = 1, linetype = "dashed") +
-  stat_function(fun = gammalog, color = "black", size = 1) +
-  aes(
-    x = lf / sqrt(2),
-    y = 10^(log10(p)),
+  ggplot(   
+    aes(x = lf / sqrt(2))) +
+   aes(
+
+    ## y = p on a log10 scale to overlay the gammalog / lognlog curves directly
+    y = p,
     color = as.factor(sname),
     shape = as.factor(sname)
   ) +
+  stat_function(fun = function(x) 10^lognlog(x), color = "black", size = 1, linetype = "dashed") +
+  stat_function(fun = function(x) 10^gammalog(x), color = "black", size = 1) +
+ 
   geom_point(size = 3, stroke = 1.3) +
   scale_x_continuous("Rescaled log relative abundance") +
   scale_y_log10("Probability density", labels = fancy_scientific) +
   theme(legend.position = "none") +
-  facet_wrap(~ sname)
-p_afd
+  facet_wrap(~ sname) +
+  main_theme
 
-# ggsave(filename = sprintf("outputs/figures/lawsdiv_afd_%s.pdf", ts),
-#        plot = p_afd, width = 10, height = 5)
+
+
+dh_per_asv %>%
+  ggplot() +
+    aes(
+    ## x = lf/√2: extra rescaling to match the Grilli paper's x-axis convention
+    ##     (their gammalog uses sqrt(trigamma(k)) as the scale, which ≈ √2 at k=1.7)
+    x = lf / sqrt(2),
+    ## y = p on a log10 scale to overlay the gammalog / lognlog curves directly
+    y = p,
+    color = as.factor(sname),
+    shape = as.factor(sname),
+    group = otu_id
+  ) +
+ stat_function(fun = function(x) 10^lognlog(x), color = "black", linetype = "dashed") +
+  stat_function(fun = function(x) 10^gammalog(x), color = "black") +
+
+  geom_line(size = 1, stroke = 1.3, alpha =0.3) +
+  scale_x_continuous("Rescaled log relative abundance") +
+  scale_y_log10("Probability density", labels = fancy_scientific) +
+  theme(legend.position = "none") +
+  facet_wrap(~ sname) +
+  main_theme 
 ```
 
 If `dh` is empty (no OTU present in essentially every grid), the AFD plot
@@ -454,11 +565,14 @@ final summary table consumed downstream.
 
 ```{r mean-pars}
 mean_pars <- estimate_mean %>%
+  ## MAD parameters per kingdom: c (cutoff), mu and sigma (lognormal), stot (total richness)
   select(idall, sname, nf, c, mu, sigma, stot) %>%
   left_join(
     gamma_pars %>%
       filter(f > 1e-5, vf > 0) %>%
       group_by(sname) %>%
+      ## mbeta = mean Gamma shape across OTUs = average stability of abundance fluctuations
+      ##         higher mbeta → community tends toward stable, less variable OTUs
       summarise(mbeta = mean(beta), .groups = "drop"),
     by = "sname"
   )
@@ -466,38 +580,20 @@ mean_pars <- estimate_mean %>%
 mean_pars
 ```
 
-# Save fitted parameters
+# Simulate community
 
-We persist `proj`, `gamma_pars`, `mean_pars`, `cutoffs`, `estimate_mean`,
-`statp` to `outputs/heavy_computation_save/`. Per `CLAUDE.md`, we never
-overwrite an existing `.Rdata` file: if the canonical path already exists,
-we save under a timestamped name and warn the user via the console.
+```{r}
+gamma_pars %>%
+  mutate(intercept_tay = log(vf) - 2*log(f),
+         beta2 = 1/exp(intercept_tay)) 
+```
+Same beta tahn the already computed one
 
-```{r save-pars}
-dir.create("outputs/heavy_computation_save", showWarnings = FALSE,
-           recursive = TRUE)
+## Bacteria
 
-out_path  <- "outputs/heavy_computation_save/lawsdiv_bact_fungi.Rdata"
-out_stamp <- sprintf(
-  "outputs/heavy_computation_save/lawsdiv_bact_fungi_%s.Rdata",
-  format(Sys.time(), "%Y%m%d_%H%M%S")
-)
-
-if (file.exists(out_path)) {
-  message("** ", out_path, " already exists — saving under stamped name to ",
-          "avoid overwrite (per CLAUDE.md). New file: ", out_stamp)
-  save(proj, gamma_pars, mean_pars, cutoffs, estimate_mean, statp,
-       file = out_stamp)
-  cat("Saved to: ", out_stamp, "\n")
-} else {
-  save(proj, gamma_pars, mean_pars, cutoffs, estimate_mean, statp,
-       file = out_path)
-  cat("Saved to: ", out_path, "\n")
-}
+```{r}
+gamma_pars %>%
+  filter(bacteria) %>%
+  
 ```
 
-# Session info
-
-```{r sessioninfo}
-sessionInfo()
-```

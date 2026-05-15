@@ -29,6 +29,8 @@ library(sbm)
 library(iNEXT.3D)
 library(patchwork)
 library(alluvial)
+library(ggalluvial)
+library(RColorBrewer)
 library(PLNmodels)
 
 
@@ -426,6 +428,140 @@ alluvial(
 )
 ```
 
+## OTU block membership × taxonomy (alluvial)
+
+The previous alluvial connected **grids** across kingdoms. Here the perspective is
+reversed: for each kingdom the bipartite SBM assigns every **OTU / ASV** to a block
+(column-node membership). The alluvial links each OTU block (left) to its dominant
+taxonomic group (right); ribbon width is proportional to the number of OTUs sharing
+that (block, taxon) combination. Bacteria are shown at Phylum level, fungi at Class
+level; virus types and plant genera are parsed directly from the OTU name.
+
+```{r alluvial-taxo-data}
+# Helper: collapse rare taxa into "Other" and re-sum counts within each Block
+lump_and_recount <- function(df, tax_col, n = 12) {
+  top_taxa <- df %>%
+    group_by(.data[[tax_col]]) %>%
+    summarise(total = sum(n_OTU), .groups = "drop") %>%
+    slice_max(total, n = n, with_ties = FALSE) %>%
+    pull(.data[[tax_col]])
+  df %>%
+    mutate(!!tax_col := if_else(.data[[tax_col]] %in% top_taxa,
+                                .data[[tax_col]], "Other")) %>%
+    group_by(across(-n_OTU)) %>%
+    summarise(n_OTU = sum(n_OTU), .groups = "drop")
+}
+
+# -- Bacteria (Phylum) -------------------------------------------------------
+bact_tax_raw <- tax_table(ps_bacteria) %>%
+  as.data.frame() %>%
+  rownames_to_column("OTU")
+phylum_col_b <- intersect(c("phylum", "Phylum"), colnames(bact_tax_raw))[1]
+
+bact_alluvial <- tibble(
+  OTU   = colnames(sbm_Bact_gaussian$networkData),
+  Block = paste0("Bloc ", sbm_Bact_gaussian$memberships$bact)
+) %>%
+  left_join(
+    bact_tax_raw %>% select(OTU, Taxon = all_of(phylum_col_b)),
+    by = "OTU"
+  ) %>%
+  mutate(Taxon = coalesce(Taxon, "Unknown")) %>%
+  count(Block, Taxon, name = "n_OTU") %>%
+  lump_and_recount("Taxon")
+
+# -- Fungi (Class) -----------------------------------------------------------
+fungi_tax_raw <- tax_table(ps_fungi) %>%
+  as.data.frame() %>%
+  rownames_to_column("OTU")
+class_col_f <- intersect(c("Class", "class"), colnames(fungi_tax_raw))[1]
+
+fungi_alluvial <- tibble(
+  OTU   = colnames(sbm_Fungi_gaussian$networkData),
+  Block = paste0("Bloc ", sbm_Fungi_gaussian$memberships$fungi)
+) %>%
+  left_join(
+    fungi_tax_raw %>% select(OTU, Taxon = all_of(class_col_f)),
+    by = "OTU"
+  ) %>%
+  mutate(Taxon = coalesce(Taxon, "Unknown")) %>%
+  count(Block, Taxon, name = "n_OTU") %>%
+  lump_and_recount("Taxon")
+
+# -- Viruses (virus type = first dot-separated token of the OTU name) --------
+virus_alluvial <- tibble(
+  OTU   = colnames(sbm_Virus$networkData),
+  Block = paste0("Bloc ", sbm_Virus$memberships$virus)
+) %>%
+  mutate(Taxon = str_extract(OTU, "^[^\\.]+")) %>%
+  count(Block, Taxon, name = "n_OTU") %>%
+  lump_and_recount("Taxon")
+
+# -- Plants (genus = first word of the species name) -------------------------
+plant_alluvial <- tibble(
+  OTU   = colnames(sbm_Plant$networkData),
+  Block = paste0("Bloc ", sbm_Plant$memberships$plant)
+) %>%
+  mutate(Taxon = word(OTU, 1)) %>%
+  count(Block, Taxon, name = "n_OTU") %>%
+  lump_and_recount("Taxon")
+
+cat("Bacteria — blocks:", n_distinct(bact_alluvial$Block),
+    "| phyla:", n_distinct(bact_alluvial$Taxon), "\n")
+cat("Fungi    — blocks:", n_distinct(fungi_alluvial$Block),
+    "| classes:", n_distinct(fungi_alluvial$Taxon), "\n")
+cat("Viruses  — blocks:", n_distinct(virus_alluvial$Block),
+    "| types:", n_distinct(virus_alluvial$Taxon), "\n")
+cat("Plants   — blocks:", n_distinct(plant_alluvial$Block),
+    "| genera:", n_distinct(plant_alluvial$Taxon), "\n")
+```
+
+```{r alluvial-taxo-plot, fig.width=16, fig.height=14}
+make_taxo_alluvial <- function(data, title, palette_name = "Set3") {
+  taxa    <- sort(unique(data$Taxon))
+  n_taxa  <- length(taxa)
+  palette <- setNames(
+    colorRampPalette(brewer.pal(min(n_taxa, 11), palette_name))(n_taxa),
+    taxa
+  )
+
+  ggplot(data, aes(axis1 = Block, axis2 = Taxon, y = n_OTU)) +
+    geom_alluvium(aes(fill = Taxon), alpha = 0.75, width = 0.25) +
+    geom_stratum(width = 0.25, fill = "white",
+                 colour = "grey50", linewidth = 0.3) +
+    geom_text(stat  = "stratum",
+              aes(label = after_stat(stratum)),
+              size = 2.5, fontface = "italic") +
+    scale_x_discrete(
+      limits = c("Block", "Taxon"),
+      expand = c(0.06, 0.06)
+    ) +
+    scale_fill_manual(values = palette) +
+    labs(title = title, y = "Number of OTUs / ASVs", x = NULL) +
+    theme_bw(base_size = 10) +
+    theme(
+      legend.position = "none",
+      axis.text.x     = element_text(face = "bold", size = 11),
+      plot.title      = element_text(face = "bold", size = 12)
+    )
+}
+
+gg_bact_tax  <- make_taxo_alluvial(bact_alluvial,  "Bacteria — Phylum",    "Set3")
+gg_fungi_tax <- make_taxo_alluvial(fungi_alluvial,  "Fungi — Class",        "Paired")
+gg_virus_tax <- make_taxo_alluvial(virus_alluvial,  "Viruses — virus type", "Set1")
+gg_plant_tax <- make_taxo_alluvial(plant_alluvial,  "Plants — Genus",       "Dark2")
+
+(gg_bact_tax | gg_fungi_tax) / (gg_virus_tax | gg_plant_tax) +
+  plot_annotation(
+    title    = "OTU block membership × taxonomic composition",
+    subtitle = "Ribbon width ∝ number of OTUs sharing a (block, taxonomic group) combination",
+    theme    = theme(
+      plot.title    = element_text(size = 14, face = "bold"),
+      plot.subtitle = element_text(size = 10, colour = "grey30")
+    )
+  )
+```
+
 
 ## PLN — bloc-level JSDM (bacteria × fungi)
 
@@ -592,7 +728,7 @@ ggplot(beta_long, aes(x = bloc, y = covariate, fill = beta)) +
 ggplot(beta_long, aes(x = beta, y = covariate, colour = kingdom)) +
   geom_vline(xintercept = 0, linetype = 2, colour = "grey50") +
   geom_jitter(height = 0.15, alpha = 0.8, size = 1.5) +
-  scale_colour_manual(values = c(bact = "#1b9e77", fungi = "#d95f02")) +
+  scale_colour_manual(values = c(bact = "#1b9e77", fungi = "#d95f02", virus = "#7570b3")) +
   facet_wrap(~ model_id, ncol = 2) +
   labs(x = expression(beta), y = NULL) +
   theme_bw(base_size = 10)
@@ -666,7 +802,7 @@ ggplot(vp_long, aes(x = kingdom, y = prop_env, fill = kingdom)) +
   geom_boxplot(width = 0.4, outlier.shape = NA) +
   geom_jitter(width = 0.1, height = 0, alpha = 0.7) +
   facet_wrap(~ model_id, nrow = 1) +
-  scale_fill_manual(values = c(bact = "#1b9e77", fungi = "#d95f02")) +
+  scale_fill_manual(values = c(bact = "#1b9e77", fungi = "#d95f02", virus = "#7570b3")) +
   scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
   labs(y = "Proportion of variance explained by env", x = NULL,
        title = "Environmental filtering, per kingdom, across models") +
@@ -702,9 +838,11 @@ omega_long <- purrr::imap_dfr(all_fits, function(fit, id) {
 ### Ω heatmap grid (8 panels)
 
 ```{r pln-omega-heatmap, fig.width=16, fig.height=9, out.width="100%"}
-n_blocs   <- length(bloc_order)
-mid_bact  <- split_at / 2
-mid_fungi <- split_at + (n_blocs - split_at) / 2
+n_blocs        <- length(bloc_order)
+split_at2      <- sum(kingdom %in% c("bact", "fungi")) + 0.5  # fungi / virus boundary
+mid_bact       <- split_at / 2
+mid_fungi      <- split_at  + (split_at2 - split_at)  / 2
+mid_virus      <- split_at2 + (n_blocs   - split_at2) / 2
 
 id_labels <- c(
   pln_full_off  = "PLN · Full + offset",
@@ -725,8 +863,8 @@ omega_long %>%
   ) %>%
   ggplot(aes(x = col, y = row, fill = value)) +
   geom_tile(colour = NA) +
-  geom_hline(yintercept = split_at, colour = "grey10", linewidth = 1.2) +
-  geom_vline(xintercept = split_at, colour = "grey10", linewidth = 1.2) +
+  geom_hline(yintercept = c(split_at, split_at2), colour = "grey10", linewidth = 1.2) +
+  geom_vline(xintercept = c(split_at, split_at2), colour = "grey10", linewidth = 1.2) +
   facet_wrap(~ model_id, nrow = 2, labeller = labeller(model_id = id_labels)) +
   scale_fill_gradient2(
     low    = "#2166ac",
@@ -738,12 +876,64 @@ omega_long %>%
     breaks = c(-1, -0.5, 0, 0.5, 1)
   ) +
   scale_x_discrete(
-    breaks = c(bloc_order[round(mid_bact)], bloc_order[round(mid_fungi)]),
-    labels = c("Bacteria", "Fungi")
+    breaks = c(bloc_order[round(mid_bact)], bloc_order[round(mid_fungi)], bloc_order[round(mid_virus)]),
+    labels = c("Bacteria", "Fungi", "Virus")
   ) +
   scale_y_discrete(
-    breaks = c(bloc_order[round(mid_bact)], bloc_order[round(mid_fungi)]),
-    labels = c("Bacteria", "Fungi")
+    breaks = c(bloc_order[round(mid_bact)], bloc_order[round(mid_fungi)], bloc_order[round(mid_virus)]),
+    labels = c("Bacteria", "Fungi", "Virus")
+  ) +
+  coord_fixed(expand = FALSE) +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x       = element_text(size = 9, colour = "grey30"),
+    axis.text.y       = element_text(size = 9, colour = "grey30", angle = 90, hjust = 0.5),
+    axis.ticks        = element_blank(),
+    strip.text        = element_text(size = 9, face = "bold"),
+    strip.background  = element_rect(fill = "#eef2f7", colour = "grey60", linewidth = 0.5),
+    legend.position   = "right",
+    legend.key.height = unit(3, "cm"),
+    legend.key.width  = unit(0.5, "cm"),
+    legend.title      = element_text(size = 9, face = "bold"),
+    panel.border      = element_rect(colour = "grey60", linewidth = 0.5),
+    panel.spacing     = unit(0.6, "lines"),
+    plot.margin       = margin(5, 5, 5, 5)
+  )
+```
+
+### Ω heatmap — diagonal zeroed (off-diagonal scale)
+
+Diagonal entries equal 1 by construction and anchor the color scale, washing out
+the cross-bloc signal. Setting them to 0 lets the palette stretch to the actual
+range of off-diagonal partial correlations.
+
+```{r pln-omega-heatmap-offdiag, fig.width=16, fig.height=9, out.width="100%"}
+omega_long %>%
+  mutate(
+    row      = factor(row, levels = bloc_order),
+    col      = factor(col, levels = bloc_order),
+    model_id = factor(model_id, levels = names(id_labels)),
+    value    = if_else(as.character(row) == as.character(col), 0, value)
+  ) %>%
+  ggplot(aes(x = col, y = row, fill = value)) +
+  geom_tile(colour = NA) +
+  geom_hline(yintercept = c(split_at, split_at2), colour = "grey10", linewidth = 1.2) +
+  geom_vline(xintercept = c(split_at, split_at2), colour = "grey10", linewidth = 1.2) +
+  facet_wrap(~ model_id, nrow = 2, labeller = labeller(model_id = id_labels)) +
+  scale_fill_gradient2(
+    low  = "#2166ac",
+    mid  = "white",
+    high = "#b2182b",
+    name = "Partial\ncorrelation\n(diag = 0)"
+  ) +
+  scale_x_discrete(
+    breaks = c(bloc_order[round(mid_bact)], bloc_order[round(mid_fungi)], bloc_order[round(mid_virus)]),
+    labels = c("Bacteria", "Fungi", "Virus")
+  ) +
+  scale_y_discrete(
+    breaks = c(bloc_order[round(mid_bact)], bloc_order[round(mid_fungi)], bloc_order[round(mid_virus)]),
+    labels = c("Bacteria", "Fungi", "Virus")
   ) +
   coord_fixed(expand = FALSE) +
   labs(x = NULL, y = NULL) +

@@ -1,0 +1,408 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-05-15"
+---
+# Load packages
+
+```{r setup, message = FALSE, warning = FALSE}
+library(tidyverse)     # data wrangling
+library(ggfortify)     # lawsdiv dep
+library(lamW)          # Lambert W (lawsdiv dep)
+library(GGally)        # lawsdiv dep
+library(ggcorrplot)    # lawsdiv dep
+library(pracma)        # erfc, used by fun_erf / estimatemean_f
+library(phyloseq)      # to read ps_bacteria.Rdata / ps_fungi.Rdata
+library(scales)        # for fancy labellers used in mytheme
+library(RColorBrewer)
+library(broom)         # to reforam lm of taylor's law
+```
+
+# Define theme and core estimators inline
+
+```{r lawsdiv-helpers}
+## --- project plotting theme (matches scripts/3_plant_community_structure.R) ---
+main_theme <- theme_minimal() +
+  theme(line = element_blank(),
+        axis.line = element_line(colour = "black"),
+        panel.border = element_blank(),
+        axis.ticks = element_line(colour = "black"),
+        axis.text.x = element_text(colour = "black", size = 22),
+        axis.text.y = element_text(colour = "black", size = 22),
+        legend.title = element_text(colour = "black", size = 20, hjust = 0.5),
+        legend.text = element_text(colour = "black", size = 18),
+        axis.title = element_text(size = 28),
+        strip.text = element_text(colour = "black", size = 15, face = "italic"))
+```
+
+# Load and aggregate data
+
+```{r load-data}
+load("outputs/clean_data_to_analise/ps_bacteria.Rdata")
+load("outputs/clean_data_to_analise/ps_fungi.Rdata")
+
+## merge_samples() default fun = sum -> grid-level reads are SUMMED across
+## quadrats, not averaged. Matches lawsdiv_bact_fungi_analysis.Rmd; switching
+## to fun = mean would require re-running that script too.
+ps_bacteria_grid <- merge_samples(ps_bacteria, "grid") %>%
+  prune_samples(!str_detect(sample_names(.), "21-CAM-1[45]"), .)
+
+ps_fungi_grid <- merge_samples(ps_fungi, "grid_code") %>%
+  prune_samples(!str_detect(sample_names(.), "21_CAM_1[45]"), .)
+
+cat("Bacteria grid-level phyloseq:\n"); print(ps_bacteria_grid)
+cat("\nFungi grid-level phyloseq:\n"); print(ps_fungi_grid)
+```
+
+```{r extract-otu-tables}
+bacteria_grid_df <- ps_bacteria_grid %>% otu_table() %>% t() %>% as.data.frame()
+fungi_grid_df    <- ps_fungi_grid    %>% otu_table() %>% t() %>% as.data.frame()
+cat("bacteria_grid_df: ", dim(bacteria_grid_df), "\n")
+cat("fungi_grid_df:    ", dim(fungi_grid_df),    "\n")
+```
+
+# Build datatax (long format)
+
+Long data frame with columns:
+
+- `project_id`     = `"prairiom2026"`
+- `classification` = `"bacteria"` or `"fungi"` (the two environments)
+- `otu_id`         = OTU/ASV row name
+- `grid_code`      = grid code (sample after `merge_samples`)
+- `nreads`         = integer reads for that OTU in that grid
+- `tot_reads`      = column sum of reads across all OTUs in that grid
+
+`tot_reads` is computed from the wide matrix **before** dropping zeros (so
+absent OTUs still contribute their zero to the column total — i.e. don't
+inflate the total), then joined back. We then filter `nreads > 0` so only
+present OTUs occupy rows.
+
+```{r build-datatax}
+## Pivot wide OTU x grid matrix to long, attach grid-level read totals via a
+## pre-computed join (avoids leaving the output silently grouped by grid_code).
+to_long <- function(wide_df, classification) {
+
+  tot_reads_per_grid <- tibble(
+    grid_code = colnames(wide_df),
+    tot_reads = colSums(wide_df)
+  )
+
+  wide_df %>%
+    rownames_to_column("otu_id") %>%
+    pivot_longer(-otu_id, names_to = "grid_code", values_to = "nreads") %>%
+    left_join(tot_reads_per_grid, by = "grid_code") %>%
+    mutate(project_id     = "prairiom2026",
+           classification = classification)
+}
+```
+
+# Compute moments
+
+Working on presence only to compute mean and variance of relative abundance
+conditional on presence:
+
+$$\mathbb{E}[X \mid \text{present}]$$
+
+```{r apply-to-long}
+datatax <- bind_rows(
+  to_long(bacteria_grid_df, "bacteria"),
+  to_long(fungi_grid_df,    "fungi")
+) %>%
+  filter(nreads > 0)
+
+cat("datatax dimensions: ", dim(datatax), "\n")
+head(datatax)
+
+datatax %>%
+  group_by(classification) %>%
+  summarise(n_runs = n_distinct(grid_code),
+            n_otus = n_distinct(otu_id),
+            mean_nreads = mean(nreads),
+            median_nreads = median(nreads)) %>%
+  print()
+```
+
+$$\mathbb{E}[X] = P(\text{present}) \cdot \mathbb{E}[X \mid \text{present}] + P(\text{absent}) \cdot \mathbb{E}[X \mid \text{absent}]$$
+$$ \mathbb{E}[X \mid \text{absent}] = 0$$
+$$\mathbb{E}[X] = P(\text{present}) \cdot \mathbb{E}[X \mid \text{present}]$$
+
+```{r moment-df}
+reads_tot_cutoff <- 10^1
+
+## Per-OTU statistics computed on grids where the OTU is present (datatax was
+## already filtered to nreads > 0), then re-weighted by occupancy o to recover
+## unconditional moments via the law of total expectation.
+##   cond_mean_rel_ab = E[p | present]
+##   cond_s_moment    = E[p^2 | present] with bias correction (n^2 -> n*(n-1)),
+##                      which removes the Poisson shot-noise term E[p/N]
+##   mean_rel_ab      = o * E[p | present]              = E[p]
+##   s_moment         = o * E[p^2 | present]            = E[p^2]
+##   var_rel_ab       = E[p^2] - E[p]^2                 = Var[p]
+moment_df <- datatax %>%
+  filter(tot_reads > reads_tot_cutoff) %>%
+  group_by(classification) %>%
+  mutate(n_runs = n_distinct(grid_code)) %>%   # total grids per kingdom (constant within group)
+  group_by(classification, otu_id) %>%
+  summarise(n_runs           = first(n_runs),
+            cond_mean_rel_ab = mean(nreads / tot_reads),
+            o                = n() / first(n_runs),
+            cond_s_moment    = mean((nreads^2 - nreads) / tot_reads^2),
+            .groups = "drop") %>%
+  mutate(mean_rel_ab = cond_mean_rel_ab * o,
+         s_moment    = cond_s_moment    * o,
+         var_rel_ab  = s_moment - mean_rel_ab^2)
+```
+
+# Taylor's law
+
+Taylor's law predicts $\mathrm{Var}[p] \propto \mathbb{E}[p]^{2}$ (slope 2 in
+log–log). The black reference line has slope 2; the blue line is the fitted
+regression per kingdom. Slope close to 2 → Taylor's law holds and a constant
+β makes sense; large deviation → the constant-β framework is shaky for that
+kingdom.
+
+```{r taylor-plot}
+moment_df %>%
+  filter(mean_rel_ab > 0, var_rel_ab > 0) %>%
+  ggplot(aes(mean_rel_ab, var_rel_ab)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", formula = y ~ x, se = TRUE, colour = "steelblue") +
+  geom_abline(slope = 2, linetype = "dashed") +
+  facet_wrap(~classification) +
+  scale_x_log10() +
+  scale_y_log10() +
+  main_theme
+```
+
+```{r taylor-fit}
+## Formal slope test per kingdom: log(Var[p]) ~ log(E[p]).
+## Expected slope = 2 under Taylor's law.
+taylor_fits <- moment_df %>%
+  filter(mean_rel_ab > 0, var_rel_ab > 0) %>%
+  nest(data = -classification) %>%
+  mutate(fit    = map(data, ~ lm(log(var_rel_ab) ~ log(mean_rel_ab), data = .x)),
+         tidy   = map(fit, broom::tidy, conf.int = TRUE)) %>% # turn fit into a tidy table
+  select(classification, tidy) %>%
+  unnest(tidy)
+
+taylor_fits   # slope = row with term == "log(mean_rel_ab)"
+```
+# Gamma
+
+Per-OTU Gamma shape $\hat\beta_i = \bar{x}_i^2 / \sigma_{x_i}^2$ and
+scale $\hat\theta_i = \bar{x}_i / \hat\beta_i$. Under Taylor's law the
+$\hat\beta_i$ collapse to a single constant β; we take the median as a
+robust point estimate. Low-occupancy OTUs have noisy variance estimates, so
+we also compute the median restricted to occupancy `o > 0.5` (Grilli Fig 1c
+style) — useful as a sensitivity check.
+
+```{r gamma-pars}
+gamma_pars <- moment_df %>%
+  mutate(beta  = mean_rel_ab^2 / var_rel_ab,
+         theta = mean_rel_ab / beta)
+
+## Log-beta distribution split by occupancy. Unimodal & tight => constant-β
+## holds; bimodal / heavy-tailed => low-occupancy OTUs are distorting things.
+gamma_pars %>%
+  filter(beta > 0, is.finite(beta)) %>%
+  mutate(occupancy = if_else(o > 0.5, "high (o > 0.5)", "low (o <= 0.5)")) %>%
+  ggplot(aes(log(beta), fill = occupancy)) +
+  geom_histogram(bins = 40, position = "identity", alpha = 0.5) +
+  facet_wrap(~classification, scales = "free_y") +
+  main_theme
+```
+
+```{r beta-med}
+## Both options computed; choose one at simulation time.
+beta_med <- gamma_pars %>%
+  group_by(classification) %>%
+  summarise(n_otu               = n(),
+            n_with_var          = sum(mean_rel_ab > 0 & o > 0.5, na.rm = TRUE),
+            median_beta_all     = median(beta[mean_rel_ab > 0], na.rm = TRUE),
+            median_beta_highocc = median(beta[mean_rel_ab > 0 & o > 0.5], na.rm = TRUE),
+            .groups = "drop")
+
+beta_med
+```
+
+# MAD
+
+Lognormal MAD: the mean relative abundances $\bar{x}_i$ are assumed
+$\log\bar{x}_i \sim \mathcal{N}(\mu, \sigma^2)$ above a detection cutoff $c$.
+We fit $(\mu, \sigma)$ by truncated-lognormal MLE and then estimate the total
+number of species $s_\text{tot}$ in two ways (compared below).
+
+```{r mad-hist}
+## Diagnostic — log(mean_rel_ab) should be roughly bell-shaped above the cutoff
+## for the truncated-lognormal MLE to be meaningful.
+gamma_pars %>%
+  filter(mean_rel_ab > 0) %>%
+  ggplot(aes(log(mean_rel_ab))) +
+  geom_histogram(bins = 40) +
+  facet_wrap(~classification, scales = "free") +
+  main_theme
+```
+
+```{r fun-erf}
+## Truncated-lognormal MLE (Grilli SI Eqs. 50-52): two equations in (mu, sigma)
+## reduced to 1D by algebraically eliminating sigma from the second equation.
+## fun_erf returns the residual of the first MLE equation; uniroot finds mu.
+fun_erf <- function(mu, c, m1, m2){
+
+  sigma <- sqrt(m2 - m1*mu - c * m1 + mu * c)
+
+  z <- (c - mu) / (sqrt(2) * sigma)
+  correction <- sqrt(2 / pi) * sigma * exp(-z^2) / erfc(z)
+
+  res1 <- m1 - (correction + mu)
+  return(res1)
+}
+
+estimatemean_mu <- function(m1, m2, c){
+  mumin <- (c * m1 - m2) / (c - m1)
+  muest <- uniroot(fun_erf, c = c, m1 = m1, m2 = m2,
+                   interval = c(-50, mumin - 0.001), tol = 0.0001)$root
+}
+```
+
+```{r mad-fit}
+## Cutoff c = 10th percentile of log(mean_rel_ab) per kingdom — drops the
+## sparsely-observed bottom tail where the empirical mean is unreliable.
+cutoffs <- gamma_pars %>%
+  group_by(classification) %>%
+  summarise(c = as.numeric(quantile(log(mean_rel_ab), 0.1)), .groups = "drop")
+
+## Both s_tot definitions are computed; pick one at simulation time.
+##   s_tot_comp (SI Eq. 55) — compositional: <xi>·s_tot = 1 => s_tot = 1/<xi>.
+##                            Sensitive to sigma; often unstable.
+##   s_tot_erfc (SI Eq. 53) — inverts the truncated-lognormal CDF using the
+##                            number of species observed above c. Preferred.
+mad_pars <- gamma_pars %>%
+  left_join(cutoffs, by = "classification") %>%
+  mutate(log_mean_rel_ab = log(mean_rel_ab)) %>%
+  filter(log_mean_rel_ab > c) %>%
+  group_by(classification, c) %>%
+  summarise(m1    = mean(log_mean_rel_ab),
+            m2    = mean(log_mean_rel_ab^2),
+            S_obs = n_distinct(otu_id),
+            .groups = "drop") %>%
+  rowwise() %>%   # uniroot is scalar; force per-row evaluation
+  mutate(mu         = estimatemean_mu(m1, m2, c),
+         sigma      = sqrt(m2 - m1*mu - c*m1 + mu*c),
+         s_tot_comp = 1 / exp(mu + sigma^2/2),
+         s_tot_erfc = 2 * S_obs / erfc((c - mu) / (sqrt(2) * sigma))) %>%
+  ungroup()
+
+mad_pars   # compare s_tot_comp vs s_tot_erfc per kingdom
+```
+
+```{r s-tot-observed}
+## Total observed OTUs per kingdom (no cutoff) — reference value to compare
+## against the MAD-extrapolated s_tot_comp / s_tot_erfc.
+S_tot <- gamma_pars %>%
+  group_by(classification) %>%
+  summarise(S_observed = n_distinct(otu_id), .groups = "drop")
+
+S_tot
+```
+# Simulate communities
+
+Each kingdom is simulated independently with its own fitted parameters and its
+own observed grid-level read depths. The two `# ----` toggles at the top of
+the `map()` body switch between (i) the two `s_tot` definitions and (ii) the
+two β medians.
+
+Result lives in `simulations`, a named list:
+- `simulations$bacteria$xi`                — drawn species pool (relative abund.)
+- `simulations$bacteria$rel_abundance_sim` — species × grid matrix of realised
+                                              relative abundances (gamma AFD)
+- `simulations$bacteria$abundance_sim`     — species × grid integer reads
+                                              (multinomial)
+- `simulations$bacteria$abundance_sim_final` — same, with undetected species
+                                                dropped
+(same structure under `simulations$fungi`).
+
+## Grid-level read depths (used to size the multinomial step)
+```{r tot-reads-df}
+## tot_reads is already a column in datatax 
+tot_reads_df <- datatax %>%
+  distinct(classification, grid_code, tot_reads)
+```
+
+## Run the simulation for both kingdoms
+```{r simulate}
+set.seed(2026)
+
+simulations <- c("bacteria", "fungi") %>%
+  set_names() %>%
+  map(function(k) {
+
+    pars  <- mad_pars     %>% filter(classification == k)
+    bpars <- beta_med     %>% filter(classification == k)
+    grids <- tot_reads_df %>% filter(classification == k)
+
+    ## ---- pick s_tot definition (uncomment one) ----
+    s_pool <- pars$s_tot_comp
+    # s_pool <- pars$s_tot_erfc
+
+    ## ---- pick beta (uncomment one) ----
+    beta_use <- bpars$median_beta_all
+    # beta_use <- bpars$median_beta_highocc
+
+    ## Step A — species pool from lognormal MAD, renormalised so sum(xi) = 1.
+    xi <- exp(rnorm(round(s_pool), mean = pars$mu, sd = pars$sigma))
+    xi <- xi / sum(xi)
+
+    ## Step B — gamma realised relative abundances per grid
+    ##          (shape = beta, mean = xi), then column-normalised to sum to 1.
+    rel_abundance_sim <- replicate(
+      nrow(grids),
+      rgamma(length(xi), shape = beta_use, scale = xi / beta_use)
+    ) %>% prop.table(margin = 2)
+
+    ## Step C — multinomial reads using each grid's real read depth.
+    abundance_sim <- map2(
+      grids$tot_reads, asplit(rel_abundance_sim, 2),
+      ~ rmultinom(1, size = .x, prob = .y)
+    ) %>% do.call(cbind, .)
+    colnames(abundance_sim) <- grids$grid_code
+
+    ## Step D — drop species never detected (mirrors what real sampling produces).
+    abundance_sim_final <- abundance_sim[rowSums(abundance_sim) > 0, ]
+
+    list(xi                  = xi,
+         rel_abundance_sim   = rel_abundance_sim,
+         abundance_sim       = abundance_sim,
+         abundance_sim_final = abundance_sim_final)
+  })
+
+```
+
+## Sanity checks
+
+```{r sim-shape}
+## Simulated vs observed matrix shapes. Column count must match (grids);
+## row count differs because the species pool is the extrapolated s_tot
+## and undetected species are dropped at the end.
+list(bacteria_obs = dim(bacteria_grid_df),
+     bacteria_sim = dim(simulations$bacteria$abundance_sim_final),
+     fungi_obs    = dim(fungi_grid_df),
+     fungi_sim    = dim(simulations$fungi$abundance_sim_final))
+```
+
+```{r sim-depths}
+## rmultinom preserves the size argument exactly, so simulated column sums
+## should equal the observed read depths.
+all.equal(unname(colSums(simulations$bacteria$abundance_sim)),
+          tot_reads_df %>% filter(classification == "bacteria") %>% pull(tot_reads))
+
+all.equal(unname(colSums(simulations$fungi$abundance_sim)),
+          tot_reads_df %>% filter(classification == "fungi") %>% pull(tot_reads))
+```
+
+```{r}
+library(sbm)
+
+plotMyMatrix(t(log1p(simulations$fungi$abundance_sim_final)))
+```
+
